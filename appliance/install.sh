@@ -76,7 +76,7 @@ printf '    arch:    %s\n' "$(uname -m)"
 printf '    kernel:  %s\n' "$(uname -r)"
 RAM_MB="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)"
 printf '    RAM:     %s MB\n' "$RAM_MB"
-[ "$RAM_MB" -lt 1500 ] && warn "Sotto 1.5 GB: l'agent gira largo, ma CrowdSec (A4) andra' tenuto d'occhio."
+[ "$RAM_MB" -lt 1500 ] && warn "Sotto 1.5 GB: l'agent ci sta largo, ma non caricare il box di altri servizi."
 UPLINK="$(awk '$2=="00000000" {print $1; exit}' /proc/net/route 2>/dev/null || true)"
 if [ -n "$UPLINK" ]; then
     SPEED="$(cat "/sys/class/net/$UPLINK/speed" 2>/dev/null || echo "?")"
@@ -86,20 +86,29 @@ else
     warn "Nessuna rotta di default: il box non ha ancora rete."
 fi
 
-# Il supporto di boot decide la vita del box. La flash consumer di una TV box
-# si consuma con i log; non possiamo spostare il rootfs da qui, ma possiamo
-# dirlo chiaramente e mitigare con log2ram.
+# Il supporto di boot decide la vita del box: la flash consumer si consuma a
+# scritture, e chi scrive di continuo sono i log. Se pero' i log stanno gia' in
+# RAM il problema e' risolto, e allarmare lo stesso sarebbe solo rumore.
 ROOT_SRC="$(findmnt -no SOURCE / 2>/dev/null || echo '')"
 ROOT_DISK="$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null || echo '')"
 ON_FLASH=0
 case "$ROOT_DISK" in
     mmcblk*) ON_FLASH=1 ;;
 esac
-if [ "$ON_FLASH" -eq 1 ]; then
-    warn "Root su $ROOT_DISK (eMMC/microSD): flash consumer, si consuma coi log."
-    warn "Consigliato reinstallare con root su SSD USB. Intanto attivo log2ram."
-else
+
+LOG_ON_RAM=0
+systemctl is-active --quiet armbian-ramlog 2>/dev/null && LOG_ON_RAM=1
+case "$(findmnt -no SOURCE /var/log 2>/dev/null)" in
+    /dev/zram*) LOG_ON_RAM=1 ;;
+esac
+
+if [ "$ON_FLASH" -eq 0 ]; then
     ok "Root su $ROOT_DISK, non su flash interna"
+elif [ "$LOG_ON_RAM" -eq 1 ]; then
+    ok "Root su $ROOT_DISK (flash), ma i log stanno in RAM: va bene cosi'"
+else
+    warn "Root su $ROOT_DISK (eMMC/microSD) e log su flash: si consuma."
+    warn "Provo ad attivare log2ram; valuta comunque root su SSD USB."
 fi
 
 # ---------------------------------------------------------------------------
@@ -117,13 +126,8 @@ PKGS=(python3 python3-venv python3-pip curl ca-certificates iputils-ping unatten
 run apt-get install -y -qq "${PKGS[@]}"
 ok "pacchetti essenziali installati"
 
-# Log in RAM: Armbian di suo monta /var/log su zram (armbian-ramlog), quindi
-# nella maggior parte dei casi non serve aggiungere niente.
-LOG_ON_RAM=0
-systemctl is-active --quiet armbian-ramlog 2>/dev/null && LOG_ON_RAM=1
-case "$(findmnt -no SOURCE /var/log 2>/dev/null)" in
-    /dev/zram*) LOG_ON_RAM=1 ;;
-esac
+# Armbian di suo monta /var/log su zram (armbian-ramlog): nella maggior parte
+# dei casi non serve aggiungere niente. LOG_ON_RAM e' gia' stato rilevato sopra.
 if [ "$LOG_ON_RAM" -eq 1 ]; then
     ok "/var/log gia' in RAM: la flash non viene consumata dai log"
 elif [ "$ON_FLASH" -eq 1 ]; then

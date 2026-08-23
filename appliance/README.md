@@ -3,6 +3,11 @@
 Un piccolo computer sotto Armbian (TV box, Raspberry, mini PC) che monitora la rete
 di un sito, ne diventa il punto di accesso remoto e comanda il firewall del router.
 
+> **Devi installarne uno adesso?** Segui **[INSTALLAZIONE.md](INSTALLAZIONE.md)**:
+> è la procedura in ordine, dal sito da creare alla verifica finale, con la tabella
+> dei guasti già visti. Questo README spiega invece *perché* le cose stanno così, e
+> si legge quando qualcosa non torna.
+
 ## Dove si collega
 
 **A una porta LAN del router**, non fra modem e router.
@@ -202,9 +207,13 @@ connessione ma fallisce l'handshake TLS.
 sulla 8728, che non richiede certificati:
 
 ```
-/ip service enable api
+/ip service set api disabled=no
 /user add name=netmonitor group=read password=SCEGLINE-UNA
 ```
+
+La password: **solo lettere e numeri**. Un `#` iniziale viene letto come inizio di
+commento sia dalla console di RouterOS sia da bash, e finisci con un utente creato
+senza la password che credevi di avergli dato.
 
 Il canale però non è cifrato: le credenziali viaggiano in chiaro sulla LAN. Per un
 utente in sola lettura su una rete che controlli è un compromesso ragionevole.
@@ -213,8 +222,12 @@ Il gruppo `read` basta: il driver non scrive nulla. Poi sul box:
 
 ```bash
 sudo ./appliance/install.sh --token <token-del-sito> --site "Nome" \
-  --router-user netmonitor --router-pass SCEGLINE-UNA
+  --router-user netmonitor
 ```
+
+La password te la chiede a schermo, con l'input nascosto. È anche il modo più sicuro
+di darla: su `--router-pass` finirebbe nella cronologia della shell e sarebbe visibile
+a chiunque faccia `ps`.
 
 Con le credenziali l'agent ottiene gli stessi dati dello script incollato sul
 router — tipo di connessione, interfaccia, segnale, attribuzione all'access point —

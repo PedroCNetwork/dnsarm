@@ -33,6 +33,11 @@ class Config:
     # RouterOS presenta un certificato autofirmato: la verifica va attivata solo
     # dopo aver importato una CA sul router.
     ROUTER_VERIFY_TLS: bool = os.getenv("ROUTER_VERIFY_TLS", "false").lower() == "true"
+    # https richiede che al servizio www-ssl sia assegnato un certificato,
+    # altrimenti l'handshake TLS fallisce. Dove generarne uno e' scomodo si puo'
+    # mettere http, accettando che le credenziali viaggino in chiaro sulla LAN:
+    # e' una scelta da fare consapevolmente, non un ripiego automatico.
+    ROUTER_SCHEME: str = os.getenv("ROUTER_SCHEME", "https")
     ROUTER_TIMEOUT: float = float(os.getenv("ROUTER_TIMEOUT", "10"))
 
     # Client per richiesta. Qui non c'e' il limite di /tool fetch di RouterOS,

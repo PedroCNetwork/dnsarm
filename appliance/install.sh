@@ -29,7 +29,7 @@ SERVICE_USER=netmonitor
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TOKEN=""; SITE_NAME=""; BACKEND=""; TUNNEL_TOKEN=""; DRY_RUN=0
-ROUTER_USER=""; ROUTER_PASS=""; ROUTER_PASS_GIVEN=0
+ROUTER_USER=""; ROUTER_PASS=""; ROUTER_PASS_GIVEN=0; ROUTER_SCHEME="https"
 
 # Un'opzione senza valore deve dirlo. Prima lo `shift` di troppo faceva uscire
 # lo script in silenzio (set -e), e il caso classico non e' la distrazione: e'
@@ -52,6 +52,7 @@ while [ $# -gt 0 ]; do
         --tunnel-token) _need_value "$1" $#; TUNNEL_TOKEN="$2"; shift ;;
         --router-user)  _need_value "$1" $#; ROUTER_USER="$2"; shift ;;
         --router-pass)  _need_value "$1" $#; ROUTER_PASS="$2"; ROUTER_PASS_GIVEN=1; shift ;;
+        --router-scheme) _need_value "$1" $#; ROUTER_SCHEME="$2"; shift ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) awk 'NR>1 { if (/^#/) { sub(/^# ?/,""); print } else exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Opzione sconosciuta: $1" >&2; exit 2 ;;
@@ -280,6 +281,9 @@ ROUTER_USER=$ROUTER_USER
 ROUTER_PASSWORD='$ROUTER_PASS'
 ROUTER_DRIVER=auto
 ROUTER_VERIFY_TLS=false
+# https richiede un certificato assegnato a www-ssl sul router. Mettere http
+# solo consapevolmente: le credenziali viaggerebbero in chiaro sulla LAN.
+ROUTER_SCHEME=$ROUTER_SCHEME
 EOF
     chown root:"$SERVICE_USER" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"

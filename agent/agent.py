@@ -164,12 +164,19 @@ class Agent:
 
         from drivers.mikrotik_rest import MikroTikRestDriver
 
+        if config.ROUTER_SCHEME == "http":
+            logger.warning(
+                "Driver del router su http: utente e password viaggiano in chiaro "
+                "sulla LAN. Preferibile assegnare un certificato a www-ssl."
+            )
+
         return MikroTikRestDriver(
             host,
             config.ROUTER_USER,
             config.ROUTER_PASSWORD,
             timeout=config.ROUTER_TIMEOUT,
             verify_tls=config.ROUTER_VERIFY_TLS,
+            scheme=config.ROUTER_SCHEME,
         )
 
     async def _enrich_from_gateway(self, devices, clients):

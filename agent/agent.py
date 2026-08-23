@@ -22,6 +22,7 @@ from scanner import (
     discover_network,
     get_default_gateway,
     get_local_ip,
+    get_local_mac,
     get_local_network,
     get_uptime_seconds,
     sweep,
@@ -119,6 +120,7 @@ class Agent:
                 "version": config.AGENT_VERSION,
                 "hostname": socket.gethostname(),
                 "ip": get_local_ip(),
+                "mac": get_local_mac(),
                 "os": f"{platform.system()} {platform.release()}",
                 "uptime_seconds": get_uptime_seconds(),
             }

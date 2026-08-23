@@ -373,6 +373,27 @@ def get_local_network() -> Optional[str]:
     return None
 
 
+def get_local_mac() -> Optional[str]:
+    """MAC dell'interfaccia che porta al gateway.
+
+    Serve perche' il box compaia nell'albero al posto giusto: il router sa
+    collocare un apparato solo se ne conosce il MAC, e il box non puo'
+    scoprirlo da solo con una scansione - non interroga se stesso.
+    """
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as f:
+            righe = [ln.split() for ln in f.readlines()[1:]]
+        uplink = next((r[0] for r in righe if len(r) > 1 and r[1] == "00000000"), None)
+        if not uplink:
+            return None
+        with open(f"/sys/class/net/{uplink}/address", "r", encoding="utf-8") as f:
+            mac = f.read().strip().upper()
+        return mac or None
+    except Exception as e:
+        logger.debug("Lettura del MAC locale fallita: %s", e)
+        return None
+
+
 def get_uptime_seconds() -> Optional[int]:
     """Uptime della macchina che ospita il collector."""
     try:

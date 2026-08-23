@@ -76,18 +76,19 @@ class MikroTikRestDriver:
         try:
             resp = await client.get(f"{self.base}{path}")
         except Exception as e:
+            # Registrato, non solo scritto a debug: se falliscono tutte le
+            # letture questo e' l'unico indizio del perche', e nasconderlo
+            # lascia l'operatore davanti a "0 client" senza spiegazione.
+            self._last_error = f"{type(e).__name__}: {e}"
             logger.debug("MikroTik %s: %s non raggiungibile: %s", self.host, path, e)
             return None
         if resp.status_code == 404:
             return None
         if resp.status_code == 401:
-            logger.error(
-                "MikroTik %s: credenziali rifiutate. Controlla utente e password "
-                "in /etc/netmonitor/agent.env.",
-                self.host,
-            )
+            self._last_error = "401: credenziali rifiutate dal router"
             return None
         if resp.status_code >= 400:
+            self._last_error = f"HTTP {resp.status_code} su {path}"
             logger.debug("MikroTik %s: %s ha risposto %s", self.host, path, resp.status_code)
             return None
         try:
@@ -105,6 +106,7 @@ class MikroTikRestDriver:
 
     async def collect(self) -> GatewayData:
         data = GatewayData()
+        self._last_error = None
         async with self._client() as client:
             gateway = await self._read_gateway(client, data)
             data.gateway = gateway
@@ -118,6 +120,27 @@ class MikroTikRestDriver:
             data.clients = await self._read_clients(
                 client, data, iface_by_mac, ap_by_iface, infra_macs
             )
+
+        # Se non e' passata nemmeno una tabella non e' un router "vuoto": e' un
+        # router che non stiamo raggiungendo. Va detto per intero, con il
+        # motivo e con la verifica da fare a mano.
+        if not data.read_ok:
+            reason = self._last_error or "nessuna risposta"
+            logger.error("MikroTik %s: nessuna tabella letta. Motivo: %s", self.host, reason)
+            if "401" in reason:
+                logger.error(
+                    "Le credenziali sono rifiutate: controlla ROUTER_USER e "
+                    "ROUTER_PASSWORD in /etc/netmonitor/agent.env."
+                )
+            else:
+                logger.error(
+                    "Sul router serve il servizio REST attivo:  "
+                    "/ip service enable www-ssl"
+                )
+                logger.error(
+                    "Verifica a mano con:  curl -k -u UTENTE:PASSWORD %s/system/identity",
+                    self.base,
+                )
         return data
 
     # ------------------------------------------------------------------

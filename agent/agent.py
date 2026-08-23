@@ -311,8 +311,13 @@ class Agent:
                     d.uplink_port = porta
 
         # Un apparato di rete non e' anche un client.
-        infra = {d.mac for d in by_ip.values() if d.mac}
-        merged_clients = [c for mac, c in by_mac.items() if mac not in infra]
+        # Confronto insensibile alle maiuscole per costruzione: le sorgenti
+        # normalizzano diversamente, e un apparato duplicato in due tabelle e'
+        # un errore che si nota solo guardando il disegno.
+        infra = {d.mac.upper() for d in by_ip.values() if d.mac}
+        merged_clients = [
+            c for mac, c in by_mac.items() if mac and mac.upper() not in infra
+        ]
 
         return list(by_ip.values()), merged_clients
 

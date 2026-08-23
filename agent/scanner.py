@@ -121,7 +121,7 @@ def _parse_arp_table() -> dict[str, str]:
                     if re.match(r"\d+\.\d+\.\d+\.\d+", ip_candidate) and re.match(
                         r"([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}", mac_candidate
                     ):
-                        mapping[ip_candidate] = mac_candidate.replace("-", ":").lower()
+                        mapping[ip_candidate] = mac_candidate.replace("-", ":").upper()
         else:
             # /proc/net/arp: IP, tipo HW, flag, MAC, maschera, interfaccia.
             # Il bit 0x2 dei flag (ATF_COM) dice che la risoluzione e' andata a
@@ -139,7 +139,10 @@ def _parse_arp_table() -> dict[str, str]:
                     except ValueError:
                         complete = 0
                     if complete and parts[3] != "00:00:00:00:00:00":
-                        mapping[parts[0]] = parts[3].lower()
+                        # MAIUSCOLO, come il router: un confronto fra "88:dc:96..." e
+                        # "88:DC:96..." fallisce in silenzio, e il risultato e' un
+                        # apparato che compare due volte, come device e come client.
+                        mapping[parts[0]] = parts[3].upper()
     except Exception as e:
         logger.debug("Could not parse ARP table: %s", e)
     return mapping

@@ -214,6 +214,7 @@ class Agent:
         if config.ROUTER_DRIVER in ("auto", "mikrotik-api"):
             candidates.append(self._api_driver())
 
+        motivi = []
         for driver in candidates:
             if driver is None:
                 continue
@@ -222,13 +223,20 @@ class Agent:
                     logger.info("Driver del router: %s su %s", driver.name, driver.host)
                     self._driver = driver
                     return driver
+                motivi.append(f"{driver.name}: {getattr(driver, '_last_error', None) or 'nessuna risposta'}")
             except Exception as e:
-                logger.debug("Driver %s non utilizzabile: %s", driver.name, e)
+                motivi.append(f"{driver.name}: {type(e).__name__}: {e}")
 
+        # Il motivo va detto, non lasciato a debug: un "non riesco" senza causa
+        # costa un giro di prove a chi sta dall'altra parte.
+        logger.error("Nessun driver riesce a parlare con il router:")
+        for motivo in motivi:
+            logger.error("  %s", motivo)
         logger.error(
-            "Nessun driver riesce a parlare con il router. Verifica utente e "
-            "password, e che sia attivo il REST (RouterOS 7: /ip service enable "
-            "www-ssl con certificato) o l'API (RouterOS 6: /ip service enable api)."
+            "Diagnosi:  sudo bash -c 'set -a; . /etc/netmonitor/agent.env; set +a; "
+            "%s %s --check-router'",
+            sys.executable,
+            __file__,
         )
         return None
 
@@ -447,7 +455,77 @@ class Agent:
             logger.error("Failed to send WS message: %s", e)
 
 
+async def check_router() -> int:
+    """Diagnostica del collegamento al router. Stampa l'errore vero e si ferma.
+
+    Esiste perche' l'alternativa era far provare configurazioni a caso a chi sta
+    davanti al box: qui si vede in dieci secondi quale trasporto risponde,
+    quale no e con che errore.
+    """
+    from scanner import get_default_gateway
+
+    host = config.GATEWAY_IP or get_default_gateway()
+    print(f"Gateway:  {host or 'NON RILEVATO'}")
+    print(f"Utente:   {config.ROUTER_USER or '(non configurato)'}")
+    print(f"Password: {'impostata' if config.ROUTER_PASSWORD else 'NON IMPOSTATA'}")
+    print()
+
+    if not host:
+        print("Nessun gateway: controlla che il box abbia una rotta di default.")
+        return 1
+    if not (config.ROUTER_USER and config.ROUTER_PASSWORD):
+        print("Credenziali mancanti in /etc/netmonitor/agent.env.")
+        return 1
+
+    agent = Agent()
+    esiti = []
+    for costruttore, etichetta in (
+        (agent._gateway_driver, f"REST  {config.ROUTER_SCHEME}://{host}/rest"),
+        (agent._api_driver, f"API   {host}:8728"),
+    ):
+        driver = costruttore()
+        if driver is None:
+            continue
+        try:
+            ok = await driver.probe()
+            motivo = getattr(driver, "_last_error", None)
+            esiti.append((etichetta, ok, motivo))
+        except Exception as e:
+            esiti.append((etichetta, False, f"{type(e).__name__}: {e}"))
+
+    funzionante = None
+    for etichetta, ok, motivo in esiti:
+        if ok:
+            print(f"  OK    {etichetta}")
+            funzionante = etichetta
+        else:
+            print(f"  NO    {etichetta}")
+            print(f"        {motivo or 'nessuna risposta'}")
+
+    if funzionante is None:
+        print()
+        print("Nessun trasporto risponde. Sul router, in ordine:")
+        print("  /ip service print              i servizi devono essere senza X")
+        print("  /user print                    l'utente deve esistere")
+        print("  /ip service enable api         RouterOS 6")
+        return 1
+
+    print()
+    print("Trasporto funzionante. Provo a leggere le tabelle...")
+    data = await (agent._driver or agent._api_driver()).collect()
+    print(f"  tabelle lette:    {', '.join(data.read_ok) or 'nessuna'}")
+    print(f"  tabelle fallite:  {', '.join(data.read_failed) or 'nessuna'}")
+    print(f"  device:           {len(data.devices)}")
+    print(f"  client:           {len(data.clients)}")
+    if data.gateway:
+        print(f"  router:           {data.gateway.board} {data.gateway.version}")
+    return 0
+
+
 def main() -> None:
+    if "--check-router" in sys.argv:
+        sys.exit(asyncio.run(check_router()))
+
     if not config.AGENT_TOKEN or "YOUR" in config.AGENT_TOKEN.upper():
         logger.error(
             "AGENT_TOKEN is missing. Copy agent/.env.example to agent/.env and set the token."

@@ -296,6 +296,18 @@ class Agent:
                 c.ip = existing.ip
             by_mac[c.mac] = c
 
+        # Albero di primo livello: il router sa su quale porta sta ogni MAC,
+        # anche per gli apparati che non si annunciano via LLDP - come le
+        # antenne EnGenius standalone. Senza questo l'albero resterebbe piatto.
+        if data.port_by_mac and data.gateway and data.gateway.ip:
+            for d in by_ip.values():
+                if d.ip == data.gateway.ip or not d.mac:
+                    continue
+                porta = data.port_by_mac.get(d.mac.upper())
+                if porta and not d.parent_ip:
+                    d.parent_ip = data.gateway.ip
+                    d.uplink_port = porta
+
         # Un apparato di rete non e' anche un client.
         infra = {d.mac for d in by_ip.values() if d.mac}
         merged_clients = [c for mac, c in by_mac.items() if mac not in infra]
@@ -315,7 +327,7 @@ class Agent:
         if not config.SNMP_ENABLED or not devices:
             return devices
 
-        from drivers.generic_snmp import read_device
+        from drivers.generic_snmp import read_device, role_from_descr, vendor_from_mac
 
         comunita = [c.strip() for c in config.SNMP_COMMUNITIES if c.strip()]
         per_ip = {d.ip: d for d in devices}
@@ -333,7 +345,9 @@ class Agent:
             letti += 1
 
             device.name = info.name or device.name
-            device.vendor = info.vendor or device.vendor
+            # SNMP prima, prefisso MAC come ripiego: gli apparati che girano su
+            # net-snmp non dichiarano la marca, ma il MAC la dichiara sempre.
+            device.vendor = info.vendor or vendor_from_mac(device.mac) or device.vendor
             device.location = info.location or device.location
             if info.descr and not device.model:
                 # sysDescr e' quanto di piu' vicino a un modello si ottenga
@@ -349,6 +363,10 @@ class Agent:
             elif info.poe_ports or len({v.local_port for v in info.neighbours}) > 1:
                 # Alimenta PoE, o vede vicini su piu' porte proprie: e' uno switch.
                 device.role = "switch"
+            else:
+                # Ultima risorsa: cosa dice di essere. Non e' indovinare dal
+                # nome - sysDescr e' il campo in cui l'apparato si descrive.
+                device.role = role_from_descr(info.descr) or device.role
 
             # I vicini annunciati diventano rami dell'albero.
             for vicino in info.neighbours:

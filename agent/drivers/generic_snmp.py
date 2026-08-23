@@ -120,8 +120,40 @@ ENTERPRISE_VENDORS = {
 }
 
 
+# Enterprise che non identificano un produttore: sono stack SNMP generici usati
+# da mezzo mondo. Un access point EnGenius standalone si annuncia cosi', e
+# fermarsi qui vorrebbe dire scrivere "net-snmp (Linux)" al posto di "EnGenius".
+GENERIC_ENTERPRISES = {"8072", "2021", "311"}
+
+# Prefissi MAC. E' il ripiego quando SNMP non identifica il produttore: il MAC
+# lo dichiara sempre. Elenco breve e mirato a cio' che si incontra davvero;
+# l'importazione del registro IEEE completo e' un lavoro a parte.
+OUI_VENDORS = {
+    "88:DC:96": "EnGenius", "00:02:6F": "EnGenius", "00:19:70": "EnGenius",
+    "E4:8D:8C": "MikroTik", "74:4D:28": "MikroTik", "48:8F:5A": "MikroTik",
+    "08:55:31": "MikroTik", "64:D1:54": "MikroTik", "C4:AD:34": "MikroTik",
+    "30:DE:4B": "TP-Link", "50:C7:BF": "TP-Link", "AC:15:A2": "TP-Link",
+    "9C:A6:15": "TP-Link", "B0:95:75": "TP-Link", "F0:A7:31": "TP-Link",
+    "C8:3A:35": "Tenda", "08:40:F3": "Tenda", "50:0F:F5": "Tenda",
+    "24:5A:4C": "Ubiquiti", "FC:EC:DA": "Ubiquiti", "78:8A:20": "Ubiquiti",
+    "00:1D:AA": "D-Link", "1C:BD:B9": "D-Link",
+}
+
+
+def vendor_from_mac(mac: Optional[str]) -> Optional[str]:
+    """Produttore dal prefisso MAC. Sempre disponibile, sempre dichiarato."""
+    if not mac or len(mac) < 8:
+        return None
+    return OUI_VENDORS.get(mac.replace("-", ":").upper()[:8])
+
+
 def vendor_from_object_id(object_id: Optional[str]) -> Optional[str]:
-    """Produttore dedotto dall'enterprise number, non da parole nel testo."""
+    """Produttore dedotto dall'enterprise number, non da parole nel testo.
+
+    None anche per gli enterprise generici: dire "net-snmp" quando si voleva
+    sapere la marca e' peggio che non dire niente, perche' impedisce al
+    chiamante di provare il prefisso MAC.
+    """
     if not object_id:
         return None
     prefix = "1.3.6.1.4.1."
@@ -129,7 +161,46 @@ def vendor_from_object_id(object_id: Optional[str]) -> Optional[str]:
     if not text.startswith(prefix):
         return None
     enterprise = text[len(prefix):].split(".")[0]
+    if enterprise in GENERIC_ENTERPRISES:
+        return None
     return ENTERPRISE_VENDORS.get(enterprise, f"enterprise {enterprise}")
+
+
+# Valori che gli apparati mettono quando il campo non e' stato compilato.
+# Trattarli come dati riempirebbe la dashboard di etichette "Unknown".
+SEGNAPOSTO = {
+    "", "unknown", "none", "n/a", "not set", "<private>",
+    "sitting on the dock of the bay",  # il classico default di net-snmp
+}
+
+
+def valore_reale(testo: Optional[str]) -> Optional[str]:
+    """None se il campo contiene un segnaposto invece di un valore."""
+    if not testo:
+        return None
+    return None if testo.strip().lower() in SEGNAPOSTO else testo.strip()
+
+
+def role_from_descr(descr: Optional[str]) -> Optional[str]:
+    """Ruolo da cio' che l'apparato dice di essere.
+
+    Non e' euristica sui nomi: sysDescr e' il campo in cui l'apparato dichiara
+    la propria natura. L'EnGenius del salotto scrive "Wireless Access Point".
+    """
+    if not descr:
+        return None
+    t = descr.lower()
+    if "access point" in t or "wireless ap" in t:
+        return "access_point"
+    if "switch" in t:
+        return "switch"
+    if "router" in t or "routeros" in t:
+        return "gateway"
+    if "printer" in t:
+        return "printer"
+    if "camera" in t or "ipcam" in t:
+        return "camera"
+    return None
 
 
 def ticks_to_seconds(ticks) -> Optional[int]:
@@ -346,9 +417,9 @@ async def read_device(
         descr=system.get(OID_SYS_DESCR),
         object_id=system.get(OID_SYS_OBJECT_ID),
         uptime_seconds=ticks_to_seconds(system.get(OID_SYS_UPTIME)),
-        contact=system.get(OID_SYS_CONTACT) or None,
-        name=system.get(OID_SYS_NAME) or None,
-        location=system.get(OID_SYS_LOCATION) or None,
+        contact=valore_reale(system.get(OID_SYS_CONTACT)),
+        name=valore_reale(system.get(OID_SYS_NAME)),
+        location=valore_reale(system.get(OID_SYS_LOCATION)),
     )
     info.vendor = vendor_from_object_id(info.object_id)
     info.read_ok.append("system")

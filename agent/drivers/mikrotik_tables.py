@@ -51,6 +51,7 @@ class MikroTikTables:
             data.gateway = gateway
 
             iface_by_mac = await self._read_bridge_hosts(client, data)
+            data.port_by_mac = dict(iface_by_mac)
             neighbours, ap_by_iface, infra_macs = await self._read_neighbours(
                 client, data, iface_by_mac
             )

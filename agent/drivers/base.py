@@ -46,6 +46,10 @@ class GatewayData:
     gateway: Optional[GatewayInfo] = None
     devices: List[DiscoveredDevice] = field(default_factory=list)
     clients: List[DiscoveredClient] = field(default_factory=list)
+    # MAC -> porta del router. E' l'albero di primo livello: dice dietro quale
+    # porta sta ogni apparato, anche quelli che non si annunciano via LLDP -
+    # come le antenne EnGenius standalone, che parlano solo SNMP.
+    port_by_mac: dict = field(default_factory=dict)
     # Cosa ha funzionato davvero: serve a distinguere "nessun client WiFi" da
     # "non sono riuscito a leggere la tabella WiFi".
     read_ok: List[str] = field(default_factory=list)

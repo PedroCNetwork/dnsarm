@@ -82,6 +82,35 @@ if [ -n "$UPLINK" ]; then
     SPEED="$(cat "/sys/class/net/$UPLINK/speed" 2>/dev/null || echo "?")"
     printf '    uplink:  %s a %s Mbit/s\n' "$UPLINK" "$SPEED"
     [ "$SPEED" = "100" ] && warn "NIC a 100 Mbit: irrilevante fuori banda, sarebbe un problema solo inline."
+
+    # La rete che l'agent scansionera' davvero. Va stampata qui perche' il campo
+    # "Rete" del sito in NetMonitor si compila a mano e puo' non combaciare:
+    # l'agent usa questa, il pulsante "Scansiona rete" usa quella. Vederle
+    # entrambe evita mezz'ora di dubbi.
+    GW="$(awk '$2=="00000000" {print $3; exit}' /proc/net/route 2>/dev/null || true)"
+    if [ -n "$GW" ]; then
+        GW_IP="$(printf '%d.%d.%d.%d' \
+            "$((0x${GW:6:2}))" "$((0x${GW:4:2}))" "$((0x${GW:2:2}))" "$((0x${GW:0:2}))")"
+        printf '    gateway: %s\n' "$GW_IP"
+    fi
+    # Calcolata dalle rotte, non con ipcalc: su Armbian minimale non c'e'.
+    # Si prende la rotta di sottorete sull'interfaccia dell'uplink, cosi' su un
+    # box con Docker non si finisce per annunciare un bridge 172.x.
+    SUBNET_HEX="$(awk -v ifc="$UPLINK" \
+        '$1==ifc && $3=="00000000" && $8!="00000000" {print $2, $8; exit}' \
+        /proc/net/route 2>/dev/null || true)"
+    if [ -n "$SUBNET_HEX" ]; then
+        read -r NETHEX MASKHEX <<< "$SUBNET_HEX"
+        NET_IP="$(printf '%d.%d.%d.%d' \
+            "$((0x${NETHEX:6:2}))" "$((0x${NETHEX:4:2}))" "$((0x${NETHEX:2:2}))" "$((0x${NETHEX:0:2}))")"
+        PREFIX=0; MASKBITS=$((0x$MASKHEX))
+        while [ "$MASKBITS" -ne 0 ]; do
+            PREFIX=$((PREFIX + (MASKBITS & 1)))
+            MASKBITS=$((MASKBITS >> 1))
+        done
+        printf '    rete:    %s/%s\n' "$NET_IP" "$PREFIX"
+        printf '             ^ il campo "Rete" del sito in NetMonitor deve dire questo\n'
+    fi
 else
     warn "Nessuna rotta di default: il box non ha ancora rete."
 fi

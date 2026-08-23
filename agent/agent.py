@@ -18,6 +18,7 @@ import websockets
 
 from config import config
 from scanner import (
+    DiscoveredDevice,
     discover_network,
     get_default_gateway,
     get_local_ip,
@@ -48,6 +49,8 @@ class Agent:
         self.presence_task: asyncio.Task | None = None
         # Vuoto in configurazione = ricavato dalle rotte, non indovinato
         self.network = config.SCAN_NETWORK or get_local_network()
+        # Riempito dal driver del router, se configurato.
+        self.gateway_info = None
 
     async def run(self) -> None:
         logger.info("NetMonitor Agent starting...")
@@ -105,10 +108,11 @@ class Agent:
     def heartbeat_payload(self) -> dict:
         """Il corpo dell'heartbeat, separato dall'invio per poterlo verificare.
 
-        `collector`, non `router`: questo agent sta su una porta LAN e non e' il
-        gateway del sito. Il gateway lo descrivera' il driver in A3.
+        `collector` e `router` sono due cose distinte: il collector e' questo
+        box su una porta LAN, il router e' il gateway del sito. Coincidono solo
+        quando il collector e' lo script che gira sul router stesso.
         """
-        return {
+        payload = {
             "collector": {
                 "kind": "agent",
                 "version": config.AGENT_VERSION,
@@ -119,12 +123,116 @@ class Agent:
             }
         }
 
+        gw = getattr(self, "gateway_info", None)
+        if gw:
+            payload["router"] = {
+                "identity": gw.identity,
+                "ip": gw.ip,
+                "board": gw.board,
+                "version": gw.version,
+                "uptime_seconds": gw.uptime_seconds,
+                "cpu_load": gw.cpu_load,
+                "free_memory": gw.free_memory,
+                "total_memory": gw.total_memory,
+            }
+        return payload
+
     async def _send_heartbeat(self) -> None:
         payload = self.heartbeat_payload()
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(self.heartbeat_url, json=payload)
             resp.raise_for_status()
             logger.info("Heartbeat ok")
+
+    def _gateway_driver(self):
+        """Il driver del router del sito, se e' configurato e riconosciuto.
+
+        Senza credenziali non c'e' driver e l'agent si limita alla scansione
+        ARP: vede chi c'e', ma non sa dire se e' via cavo o radio, su quale
+        porta, con che segnale. Quelle informazioni esistono solo dentro il
+        router, e vanno chieste a lui.
+        """
+        if config.ROUTER_DRIVER == "none":
+            return None
+        if not (config.ROUTER_USER and config.ROUTER_PASSWORD):
+            return None
+
+        host = config.GATEWAY_IP or get_default_gateway()
+        if not host:
+            logger.warning("Nessun gateway rilevato: driver del router non attivabile")
+            return None
+
+        from drivers.mikrotik_rest import MikroTikRestDriver
+
+        return MikroTikRestDriver(
+            host,
+            config.ROUTER_USER,
+            config.ROUTER_PASSWORD,
+            timeout=config.ROUTER_TIMEOUT,
+            verify_tls=config.ROUTER_VERIFY_TLS,
+        )
+
+    async def _enrich_from_gateway(self, devices, clients):
+        """Unisce la scansione con quello che sa il router.
+
+        Le due fonti non sono equivalenti: il router e' autorevole su tipo di
+        connessione, interfaccia e segnale, perche' li osserva direttamente. La
+        scansione ARP serve a non perdere chi il router non conosce - un
+        dispositivo con IP statico e senza lease, per esempio.
+        """
+        driver = self._gateway_driver()
+        if driver is None:
+            self.gateway_info = None
+            return devices, clients
+
+        try:
+            data = await driver.collect()
+        except Exception as e:
+            logger.error("Lettura dal router fallita (%s): %s", driver.name, e)
+            self.gateway_info = None
+            return devices, clients
+
+        if data.read_failed:
+            logger.warning("Router: tabelle non lette: %s", ", ".join(data.read_failed))
+        logger.info(
+            "Router (%s): %d device, %d client da %s",
+            driver.name,
+            len(data.devices),
+            len(data.clients),
+            ", ".join(data.read_ok) or "nessuna tabella",
+        )
+
+        self.gateway_info = data.gateway
+
+        # Device: quelli del router hanno la precedenza, sono identificati.
+        by_ip = {d.ip: d for d in devices}
+        for d in data.devices:
+            by_ip[d.ip] = d
+        if data.gateway and data.gateway.ip and data.gateway.ip not in by_ip:
+            by_ip[data.gateway.ip] = DiscoveredDevice(
+                ip=data.gateway.ip,
+                name=data.gateway.identity,
+                vendor=data.gateway.vendor,
+                model=data.gateway.board,
+            )
+
+        # Client: chiave il MAC. Il router sovrascrive, la scansione integra.
+        by_mac = {c.mac: c for c in clients if c.mac}
+        for c in data.clients:
+            if not c.mac:
+                continue
+            existing = by_mac.get(c.mac)
+            if existing and "arp" in existing.sources and "arp" not in c.sources:
+                c.sources.append("arp")
+            if existing and not c.ip:
+                c.ip = existing.ip
+            by_mac[c.mac] = c
+
+        # Un apparato di rete non e' anche un client.
+        infra = {d.mac for d in by_ip.values() if d.mac}
+        merged_clients = [c for mac, c in by_mac.items() if mac not in infra]
+
+        return list(by_ip.values()), merged_clients
 
     async def _telemetry_loop(self) -> None:
         """Periodically scan the local network and push telemetry to the cloud."""
@@ -146,6 +254,7 @@ class Agent:
 
         logger.info("Raccolta telemetria per %s...", self.network)
         devices, clients = await sweep(self.network)
+        devices, clients = await self._enrich_from_gateway(devices, clients)
 
         sent_devices = await self._post_batch(
             {
@@ -181,6 +290,8 @@ class Agent:
                             "hostname": c.hostname,
                             "connection_type": c.connection_type,
                             "interface_name": c.interface_name,
+                            "signal_dbm": c.signal_dbm,
+                            "device_ip": c.device_ip,
                             "sources": c.sources,
                         }
                         for c in chunk

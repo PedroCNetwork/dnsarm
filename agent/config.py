@@ -23,6 +23,18 @@ class Config:
     # Gateway del sito. Vuoto = rilevato dalla rotta di default.
     GATEWAY_IP: str = os.getenv("GATEWAY_IP", "")
 
+    # Credenziali di sola lettura sul router del sito. Senza, l'agent si limita
+    # alla scansione ARP: vede chi risponde, ma non sa il tipo di connessione,
+    # l'interfaccia ne' il segnale, che stanno solo nelle tabelle del router.
+    ROUTER_USER: str = os.getenv("ROUTER_USER", "")
+    ROUTER_PASSWORD: str = os.getenv("ROUTER_PASSWORD", "")
+    # auto = prova a riconoscere il router; none = disattiva del tutto
+    ROUTER_DRIVER: str = os.getenv("ROUTER_DRIVER", "auto")
+    # RouterOS presenta un certificato autofirmato: la verifica va attivata solo
+    # dopo aver importato una CA sul router.
+    ROUTER_VERIFY_TLS: bool = os.getenv("ROUTER_VERIFY_TLS", "false").lower() == "true"
+    ROUTER_TIMEOUT: float = float(os.getenv("ROUTER_TIMEOUT", "10"))
+
     # Client per richiesta. Qui non c'e' il limite di /tool fetch di RouterOS,
     # ma spezzare resta utile: un lotto che fallisce non porta via tutto.
     CLIENT_BATCH_SIZE: int = int(os.getenv("CLIENT_BATCH_SIZE", "50"))

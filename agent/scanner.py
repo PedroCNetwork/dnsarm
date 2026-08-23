@@ -46,7 +46,10 @@ class DiscoveredClient:
     hostname: Optional[str] = None
     connection_type: str = "unknown"
     interface_name: Optional[str] = None
-    # Chi lo ha visto. "arp" = ha risposto al ping ed e' nella tabella ARP.
+    # Solo il router li conosce: una scansione dalla LAN non puo' saperli.
+    signal_dbm: Optional[int] = None
+    device_ip: Optional[str] = None
+    # Chi lo ha visto: "arp" dalla scansione, "dhcp"/"wifi"/"bridge" dal router.
     sources: List[str] = field(default_factory=list)
 
 

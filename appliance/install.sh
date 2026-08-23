@@ -4,6 +4,9 @@
 #
 #   sudo ./install.sh --token <agent-token> [--site "Nome Sito"] [--backend URL]
 #   sudo ./install.sh --token <t> --tunnel-token <t>   aggiunge l'accesso remoto
+#   sudo ./install.sh --token <t> --router-user netmonitor --router-pass <pw>
+#       legge le tabelle del router (lease DHCP, WiFi, bridge): senza, il
+#       monitoraggio si ferma a "chi risponde", senza tipo ne' segnale.
 #   sudo ./install.sh --dry-run --token x        mostra cosa farebbe, non tocca nulla
 #
 # --tunnel-token e' il token del Cloudflare Tunnel, preso dalla dashboard Zero
@@ -26,12 +29,15 @@ SERVICE_USER=netmonitor
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TOKEN=""; SITE_NAME=""; BACKEND=""; TUNNEL_TOKEN=""; DRY_RUN=0
+ROUTER_USER=""; ROUTER_PASS=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --token)        shift; TOKEN="${1:-}" ;;
         --site)         shift; SITE_NAME="${1:-}" ;;
         --backend)      shift; BACKEND="${1:-}" ;;
         --tunnel-token) shift; TUNNEL_TOKEN="${1:-}" ;;
+        --router-user)  shift; ROUTER_USER="${1:-}" ;;
+        --router-pass)  shift; ROUTER_PASS="${1:-}" ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) awk 'NR>1 { if (/^#/) { sub(/^# ?/,""); print } else exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Opzione sconosciuta: $1" >&2; exit 2 ;;
@@ -238,6 +244,13 @@ HEARTBEAT_INTERVAL=30
 # Vuoti = rilevati dalle rotte. Compilare solo se il rilevamento sbaglia.
 SCAN_NETWORK=
 GATEWAY_IP=
+# Credenziali di sola lettura sul router. Senza, l'agent vede chi c'e' ma non
+# sa se e' via cavo o radio, su quale porta, con che segnale: quei dati
+# stanno solo nelle tabelle del router.
+ROUTER_USER=$ROUTER_USER
+ROUTER_PASSWORD=$ROUTER_PASS
+ROUTER_DRIVER=auto
+ROUTER_VERIFY_TLS=false
 EOF
     chown root:"$SERVICE_USER" "$ENV_FILE"
     chmod 0640 "$ENV_FILE"

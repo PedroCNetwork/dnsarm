@@ -180,6 +180,46 @@ Dopo ogni modifica:
 sudo systemctl restart netmonitor-agent
 ```
 
+## Leggere le tabelle del router
+
+Una scansione dalla LAN vede solo **chi risponde**. Lease DHCP, registration-table
+WiFi con il segnale e bridge host table stanno dentro il router: vanno chieste a lui.
+
+Sul MikroTik, una volta sola:
+
+```
+/ip service enable www-ssl
+/user add name=netmonitor group=read password=SCEGLINE-UNA
+```
+
+Il gruppo `read` basta: il driver non scrive nulla. Poi sul box:
+
+```bash
+sudo ./appliance/install.sh --token <token-del-sito> --site "Nome" \
+  --router-user netmonitor --router-pass SCEGLINE-UNA
+```
+
+Con le credenziali l'agent ottiene gli stessi dati dello script incollato sul
+router — tipo di connessione, interfaccia, segnale, attribuzione all'access point —
+e il router non ha più bisogno di quello script.
+
+Nel log comparirà:
+
+```
+Router (mikrotik-rest): N device, M client da system, bridge, neighbor, dhcp, wifi
+```
+
+L'elenco finale dice **quali tabelle** sono state lette davvero: serve a distinguere
+"nessun client WiFi" da "non sono riuscito a leggere la tabella WiFi".
+
+Sul certificato: RouterOS ne presenta uno autofirmato, quindi la verifica TLS è
+disattivata di default. La connessione resta cifrata e la controparte è un indirizzo
+sulla LAN, non un host su Internet. Chi vuole la verifica importa una CA sul router e
+mette `ROUTER_VERIFY_TLS=true` in `/etc/netmonitor/agent.env`.
+
+Senza credenziali non cambia nulla di quanto già funziona: l'agent continua con la
+sola scansione ARP.
+
 ## Cosa vede, e cosa non può vedere
 
 L'appliance sta su una porta LAN, quindi **non** ha accesso a lease DHCP,

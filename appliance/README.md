@@ -1,0 +1,206 @@
+# Appliance NetMonitor
+
+Un piccolo computer sotto Armbian (TV box, Raspberry, mini PC) che monitora la rete
+di un sito, ne diventa il punto di accesso remoto e comanda il firewall del router.
+
+## Dove si collega
+
+**A una porta LAN del router**, non fra modem e router.
+
+Non è una preferenza estetica: se l'appliance sta sul percorso del traffico e si
+blocca, il cliente resta offline *e* tu perdi la VPN che ti serviva per ripararlo.
+Devi salire in macchina. Fuori banda, un box morto è un disservizio di monitoraggio,
+non di connettività.
+
+Il firewall non si perde: l'appliance non deve **essere** il collo di bottiglia, deve
+**comandarlo**. Rileva, decide, e scrive le regole sul router via API (fase A4).
+
+## Cosa serve
+
+- Board ARM a 32 o 64 bit, oppure x86, con Debian/Ubuntu/Armbian e systemd. Provato
+  su TV box Rockchip RK322x (ARMv7, 32 bit); le Amlogic S9xx vanno uguale.
+- Una porta Ethernet sulla LAN del cliente, con DHCP
+- Il token del sito, dalla pagina del sito in NetMonitor
+- Facoltativo, per l'accesso remoto: un token di Cloudflare Tunnel
+
+### Sul supporto di boot
+
+La regola breve è "root su SSD USB", ma la ragione conta più della regola: la flash
+consumer di una TV box si consuma a **scritture**, e chi scrive di continuo sono i log.
+
+Armbian monta già `/var/log` su zram (`armbian-ramlog`), quindi su un box Armbian
+standard il grosso del problema è risolto e l'eMMC va bene. L'installer lo rileva e in
+quel caso non aggiunge nulla.
+
+Con i log già in RAM, l'agent e il tunnel scrivono pochissimo: l'eMMC regge. L'SSD USB
+torna necessario solo il giorno in cui il box ospiterà qualcosa con un database che
+scrive di continuo.
+
+### Vincoli accertati sul box RK322x
+
+Rilevati sul campo, non dedotti dalle schede tecniche:
+
+| Fatto | Conseguenza |
+|---|---|
+| **ARMv7 Cortex-A7, 32 bit (armhf)** | RK3229 non ha modalità 64 bit: non è una scelta dell'immagine. Ogni dipendenza va verificata per `armhf`, non per `arm64`. |
+| Tailscale ha binari armv7 ufficiali | **A2 procede senza modifiche** |
+| CrowdSec pubblica solo amd64, arm64, i386 | **A4 va ripensato**: CrowdSec non si installa qui |
+| 4 core a ~1,2 GHz, 1 GB di RAM | scansioni e servizi vanno limitati, non lanciati a briglia sciolta |
+
+**Come cambia A4.** CrowdSec non gira sul box, e non c'è un VPS dove spostarlo. Al suo
+posto, a costo zero: l'agent scarica blocklist pubbliche e le scrive nell'address-list
+del router via API, e il backend ricava le detection semplici dalla telemetria che già
+riceve. Copre la maggior parte del valore senza infrastruttura nuova.
+
+**Come cambia A2.** Niente VPN e niente control plane da ospitare: l'accesso remoto
+passa dal WebSocket che l'agent tiene già aperto verso il backend, esteso a tunnel
+TCP. Winbox e WebFig del cliente arrivano sul tuo PC attraverso NetMonitor.
+
+### Sulla RAM
+
+Questo box ha 1 GB. L'agent ci gira largo, ma la scansione va tenuta a freno: ogni
+ping è un processo, e un `/24` senza limiti ne genererebbe 254 insieme. Il tetto è
+`SCAN_CONCURRENCY` (default 32); su un `/16` alzarlo non serve, semmai abbassarlo.
+
+La NIC di questa classe è a 100 Mbit. Fuori banda è irrilevante — non è il traffico
+del cliente a passare da lì. Sarebbe stato un problema solo nella soluzione inline che
+abbiamo scartato.
+
+## Installazione
+
+```bash
+git clone <repo> netmonitor && cd netmonitor
+sudo ./appliance/install.sh --token <agent-token> --site "Nome Cliente"
+```
+
+Prima di toccare qualcosa, per vedere cosa farebbe:
+
+```bash
+sudo ./appliance/install.sh --dry-run --token <agent-token> --site "Nome Cliente"
+```
+
+Lo script è idempotente: rilanciarlo su un box già configurato aggiorna e basta.
+
+### Cosa fa
+
+1. fotografa l'hardware (scheda, RAM, velocità della NIC, supporto di boot) e lo
+   scrive nel log dell'installazione
+2. installa i pacchetti, imposta fuso orario e hostname `netmon-<sito>`
+3. arma il watchdog hardware, se la board ne ha uno
+4. installa l'agent in `/opt/netmonitor` con un venv dedicato
+5. scrive il token in `/etc/netmonitor/agent.env`, `0640 root:netmonitor`
+6. crea e avvia il servizio `netmonitor-agent`
+7. con `--tunnel-token`, installa anche `cloudflared` per l'accesso remoto
+8. verifica che il servizio giri e che il backend risponda
+
+### Cosa NON fa, di proposito
+
+**Non tocca la configurazione SSH.** Irrigidirla prima che esista una seconda via
+d'ingresso significa chiudersi fuori da un box headless a casa di un cliente. Si fa
+dopo, quando il tunnel funziona e l'hai provato.
+
+## Accesso remoto
+
+**La VPN la fa il box, non il router.** È il motivo per cui funziona uguale con un
+MikroTik, un TP-Link o la scatola dell'ISP: la marca del router non c'entra.
+
+`cloudflared` apre un tunnel **in uscita** verso Cloudflare, quindi non serve un IP
+pubblico dal cliente e non si apre niente sul suo router. Tu ti colleghi con l'app
+**WARP**, da portatile o da telefono — l'esperienza è quella di WiFiman Teleport.
+
+### Preparazione, una volta sola
+
+1. Account Cloudflare gratuito, sezione **Zero Trust**
+2. **Networks → Tunnels → Create a tunnel**, tipo *Cloudflared*: ne esce un token
+3. Nel tunnel, **Private Network**: aggiungi la LAN del cliente (es. `192.168.2.0/24`)
+4. **Settings → WARP Client**: crea il profilo e includi quella rete nello Split Tunnel
+
+### Per ogni sito
+
+```bash
+sudo ./appliance/install.sh \
+  --token <agent-token> --site "Nome Cliente" \
+  --tunnel-token <token-del-tunnel>
+```
+
+Un tunnel per sito. Usare lo stesso token su due clienti diversi li metterebbe nella
+stessa rotta: reti separate, tunnel separati.
+
+### Limiti, detti prima
+
+- **10 GB al mese** di traffico WARP sul piano gratuito. Winbox, WebFig e SSH ci
+  stanno larghi; travasare firmware o backup no.
+- Piano gratuito fino a 50 utenti, dispositivi illimitati.
+- Su ARM a 32 bit non esiste un pacchetto Debian ufficiale: l'installer prende il
+  binario dalle release GitHub. Funziona, ma gli aggiornamenti sono a carico nostro
+  (`--no-autoupdate` è impostato apposta, così non si aggiorna da solo sotto i piedi).
+- Dipendi da Cloudflare, come dipenderesti dai relay MikroTik con Back To Home.
+
+### Se il cliente ha un MikroTik ARM
+
+Attiva **anche** Back To Home sul router: due strade indipendenti. Se si pianta il
+box entri dal router, se si pianta il router entri dal box. Attenzione al modello —
+serve architettura ARM e RouterOS 7.12+: hAP lite e hAP ac lite sono MIPS e **non**
+lo supportano, l'hAP ax lite sì.
+
+**Il monitoraggio non dipende dal tunnel.** Senza `--tunnel-token` il box monitora
+esattamente come prima: sono due funzioni separate, e quella che conta di più è la
+prima.
+
+## Verifica
+
+```bash
+journalctl -u netmonitor-agent -f
+```
+
+Entro un minuto devi vedere `Heartbeat ok` e `Ciclo completato: N device, M/M client`,
+e il sito deve risultare online in NetMonitor.
+
+Il test che conta davvero, da fare una volta sola per convincersi della scelta fuori
+banda: **stacca l'alimentazione al box**. La rete del cliente deve continuare a
+funzionare come se niente fosse.
+
+## Configurazione
+
+`/etc/netmonitor/agent.env`. I due campi di rete sono vuoti di default perché vengono
+ricavati dalle rotte, non indovinati:
+
+| Campo | Vuoto significa |
+|---|---|
+| `SCAN_NETWORK` | rete presa dalla rotta di sottorete sull'interfaccia dell'uplink |
+| `GATEWAY_IP` | gateway preso dalla rotta di default |
+
+Compilali solo se il rilevamento sbaglia. Attenzione su box con Docker: le bridge
+`172.x` non devono essere scambiate per la LAN — l'agent le esclude già scegliendo
+l'interfaccia che porta al gateway.
+
+Dopo ogni modifica:
+
+```bash
+sudo systemctl restart netmonitor-agent
+```
+
+## Cosa vede, e cosa non può vedere
+
+L'appliance sta su una porta LAN, quindi **non** ha accesso a lease DHCP,
+registration-table WiFi e bridge host table del router. Un ping sweep trova gli host
+vivi e basta.
+
+Oggi (A1) i client vengono dichiarati con sorgente `arp`: hanno risposto, quindi sono
+presenti davvero. Mancano tipo di connessione, interfaccia e segnale — li recupererà
+il driver del gateway in A3, interrogando il router via API o SNMP.
+
+## Sicurezza
+
+Il box custodisce le credenziali dei router dei clienti e un ingresso nelle loro reti:
+è un bersaglio di valore.
+
+- nessuna porta in ascolto verso la LAN del cliente, la VPN esce e basta
+- il servizio gira come utente `netmonitor`, non root, con `ProtectSystem=strict`
+- il token sta in un file `0640`, separato dal codice
+- un token per sito: mai una credenziale buona per tutti i clienti
+- se un token trapela, si ruota da NetMonitor con **Ruota token** e si rilancia
+  l'installer
+
+Il filtro DNS e la raccolta di dati sui dispositivi (A5) vanno concordati per iscritto
+con il cliente. È ciò che distingue il monitoraggio dall'intercettazione.

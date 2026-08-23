@@ -29,21 +29,44 @@ SERVICE_USER=netmonitor
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TOKEN=""; SITE_NAME=""; BACKEND=""; TUNNEL_TOKEN=""; DRY_RUN=0
-ROUTER_USER=""; ROUTER_PASS=""
+ROUTER_USER=""; ROUTER_PASS=""; ROUTER_PASS_GIVEN=0
+
+# Un'opzione senza valore deve dirlo. Prima lo `shift` di troppo faceva uscire
+# lo script in silenzio (set -e), e il caso classico non e' la distrazione: e'
+# una password che comincia per '#', che la shell interpreta come inizio di
+# commento e mangia insieme a tutto il resto della riga.
+_need_value() {
+    [ "$2" -ge 2 ] || {
+        printf 'L opzione %s richiede un valore.\n' "$1" >&2
+        printf 'Se il valore contiene # $ spazi o apici, racchiudilo fra apici singoli:\n' >&2
+        printf "    %s '%s'\n" "$1" "valore#con-simboli" >&2
+        exit 2
+    }
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --token)        shift; TOKEN="${1:-}" ;;
-        --site)         shift; SITE_NAME="${1:-}" ;;
-        --backend)      shift; BACKEND="${1:-}" ;;
-        --tunnel-token) shift; TUNNEL_TOKEN="${1:-}" ;;
-        --router-user)  shift; ROUTER_USER="${1:-}" ;;
-        --router-pass)  shift; ROUTER_PASS="${1:-}" ;;
+        --token)        _need_value "$1" $#; TOKEN="$2"; shift ;;
+        --site)         _need_value "$1" $#; SITE_NAME="$2"; shift ;;
+        --backend)      _need_value "$1" $#; BACKEND="$2"; shift ;;
+        --tunnel-token) _need_value "$1" $#; TUNNEL_TOKEN="$2"; shift ;;
+        --router-user)  _need_value "$1" $#; ROUTER_USER="$2"; shift ;;
+        --router-pass)  _need_value "$1" $#; ROUTER_PASS="$2"; ROUTER_PASS_GIVEN=1; shift ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) awk 'NR>1 { if (/^#/) { sub(/^# ?/,""); print } else exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Opzione sconosciuta: $1" >&2; exit 2 ;;
     esac
     shift
 done
+
+# Password richiesta a video se manca. E' anche il modo piu' sicuro di darla:
+# sulla riga di comando finisce nella cronologia della shell e resta visibile a
+# chiunque faccia `ps` sul box finche' lo script gira.
+if [ -n "$ROUTER_USER" ] && [ "$ROUTER_PASS_GIVEN" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    printf 'Password di %s sul router (input nascosto): ' "$ROUTER_USER"
+    read -rs ROUTER_PASS
+    printf '\n'
+fi
 
 if [ -t 1 ]; then
     RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
@@ -64,6 +87,12 @@ step "Requisiti"
 command -v systemctl >/dev/null || die "Serve systemd."
 command -v apt-get   >/dev/null || die "Questo script assume Debian/Ubuntu/Armbian."
 [ -n "$TOKEN" ] || die "Manca --token. Lo trovi nella pagina del sito in NetMonitor."
+# La password finisce nel file di configurazione fra apici singoli, che systemd
+# preserva verbatim. L'unico carattere che non puo' contenere e' l'apice
+# singolo stesso: meglio dirlo adesso che scoprirlo da un 401 misterioso.
+case "$ROUTER_PASS" in
+    *"'"*) die "La password del router non puo' contenere apici singoli. Cambiala sul router." ;;
+esac
 [ -d "$REPO_DIR/agent" ] || die "Cartella agent/ non trovata accanto a install.sh."
 ok "root, systemd, apt, token e sorgenti presenti"
 
@@ -248,7 +277,7 @@ GATEWAY_IP=
 # sa se e' via cavo o radio, su quale porta, con che segnale: quei dati
 # stanno solo nelle tabelle del router.
 ROUTER_USER=$ROUTER_USER
-ROUTER_PASSWORD=$ROUTER_PASS
+ROUTER_PASSWORD='$ROUTER_PASS'
 ROUTER_DRIVER=auto
 ROUTER_VERIFY_TLS=false
 EOF

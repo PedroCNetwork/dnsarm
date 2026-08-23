@@ -522,9 +522,61 @@ async def check_router() -> int:
     return 0
 
 
+async def check_snmp(host: str, community: str) -> int:
+    """Mostra cosa un apparato espone via SNMP. Non scrive niente.
+
+    Serve prima di scrivere codice per una marca nuova: si guarda cosa risponde
+    davvero l'apparato invece di dedurlo dalla scheda tecnica. E' la lezione
+    imparata a caro prezzo con RouterOS 6.
+    """
+    from drivers.generic_snmp import read_device
+
+    print(f"Interrogo {host} con community '{community}'...\n")
+    info = await read_device(host, community, timeout=3.0)
+
+    if info is None:
+        print("Nessuna risposta. Le cause possibili sono tre, indistinguibili")
+        print("dal protocollo: SNMP disattivato, community sbagliata, o")
+        print("l'apparato limita chi puo' interrogarlo.")
+        return 1
+
+    print(f"  nome:        {info.name or '-'}")
+    print(f"  produttore:  {info.vendor or 'non identificato'}")
+    print(f"  descrizione: {(info.descr or '-')[:100]}")
+    print(f"  sysObjectID: {info.object_id or '-'}")
+    print(f"  uptime:      {info.uptime_seconds or '-'} s")
+    print(f"  posizione:   {info.location or '-'}")
+    print(f"  letto:       {', '.join(info.read_ok) or 'niente'}")
+    print(f"  non letto:   {', '.join(info.read_failed) or 'niente'}")
+
+    if info.neighbours:
+        print(f"\n  Vicini LLDP ({len(info.neighbours)}) - questo e' l'albero:")
+        for v in info.neighbours:
+            print(f"    porta {v.local_port:>4}  {v.sys_name or '?':28} {(v.sys_desc or '')[:44]}")
+    else:
+        print("\n  Nessun vicino LLDP: o non lo espone, o non ha nulla collegato.")
+
+    if info.poe_ports:
+        print(f"\n  PoE ({len(info.poe_ports)} porte):")
+        for p in info.poe_ports:
+            potenza = f"{p.power_mw/1000:.1f} W" if p.power_mw else "-"
+            print(f"    porta {p.port:>6}  {p.state:18} {potenza:>8}")
+    return 0
+
+
 def main() -> None:
     if "--check-router" in sys.argv:
         sys.exit(asyncio.run(check_router()))
+
+    if "--check-snmp" in sys.argv:
+        i = sys.argv.index("--check-snmp")
+        resto = sys.argv[i + 1:]
+        if not resto:
+            print("Uso: agent.py --check-snmp <ip> [community]")
+            sys.exit(2)
+        host = resto[0]
+        community = resto[1] if len(resto) > 1 else "public"
+        sys.exit(asyncio.run(check_snmp(host, community)))
 
     if not config.AGENT_TOKEN or "YOUR" in config.AGENT_TOKEN.upper():
         logger.error(

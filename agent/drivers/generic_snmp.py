@@ -1,0 +1,335 @@
+"""Driver SNMP generico: funziona su qualunque apparato, senza sapere che marca sia.
+
+Non e' un driver "per una marca in meno": e' il fondo su cui poggia tutto il
+resto. Le MIB standard sono le stesse su uno switch TP-Link, su un access point
+EnGenius e su un router che nessuno di noi ha mai visto, quindi con queste si
+ottiene identita' e topologia senza scrivere una riga per ogni produttore.
+
+Cosa legge, e da quale standard:
+
+* **SNMPv2-MIB** (RFC 3418) - nome, descrizione, tempo di accensione, contatto e
+  posizione. E' quello che trasforma "192.168.88.10" in "EWS330AP - Magazzino".
+* **LLDP-MIB** (IEEE 802.1AB) - i vicini annunciati su ogni porta. E' l'albero:
+  dice quale apparato sta dietro quale porta, ed e' il motivo per cui uno switch
+  gestito vale molto piu' di uno non gestito.
+* **POWER-ETHERNET-MIB** (RFC 3621) - stato e assorbimento PoE per porta. Serve
+  a distinguere "antenna spenta" da "antenna che non risponde": se la porta non
+  eroga piu' corrente il problema e' il cavo o l'alimentazione, non il firmware.
+
+Le letture sono indipendenti: un apparato che non espone LLDP resta comunque
+identificato, e uno che non fa PoE non e' un errore.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# --- SNMPv2-MIB: il gruppo "system", presente ovunque -----------------------
+OID_SYS_DESCR = "1.3.6.1.2.1.1.1.0"
+OID_SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0"
+OID_SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
+OID_SYS_CONTACT = "1.3.6.1.2.1.1.4.0"
+OID_SYS_NAME = "1.3.6.1.2.1.1.5.0"
+OID_SYS_LOCATION = "1.3.6.1.2.1.1.6.0"
+
+# --- LLDP-MIB: i vicini, cioe' l'albero ------------------------------------
+OID_LLDP_REM_CHASSIS_ID = "1.0.8802.1.1.2.1.4.1.1.5"
+OID_LLDP_REM_PORT_ID = "1.0.8802.1.1.2.1.4.1.1.7"
+OID_LLDP_REM_PORT_DESC = "1.0.8802.1.1.2.1.4.1.1.8"
+OID_LLDP_REM_SYS_NAME = "1.0.8802.1.1.2.1.4.1.1.9"
+OID_LLDP_REM_SYS_DESC = "1.0.8802.1.1.2.1.4.1.1.10"
+
+# --- POWER-ETHERNET-MIB: PoE per porta -------------------------------------
+OID_PETH_PORT_DETECTION = "1.3.6.1.2.1.105.1.1.1.6"
+OID_PETH_PORT_POWER = "1.3.6.1.2.1.105.1.1.1.11"
+
+# Stati di rilevamento PoE (pethPsePortDetectionStatus, RFC 3621)
+PETH_STATES = {
+    1: "disabled",
+    2: "searching",
+    3: "deliveringPower",
+    4: "fault",
+    5: "test",
+    6: "otherFault",
+}
+
+
+@dataclass
+class SnmpNeighbour:
+    """Un vicino annunciato via LLDP: un ramo dell'albero."""
+
+    local_port: str
+    sys_name: Optional[str] = None
+    sys_desc: Optional[str] = None
+    chassis_id: Optional[str] = None
+    port_id: Optional[str] = None
+
+
+@dataclass
+class SnmpPoePort:
+    port: str
+    state: Optional[str] = None
+    power_mw: Optional[int] = None
+
+
+@dataclass
+class SnmpDeviceInfo:
+    """Cio' che si riesce a sapere di un apparato parlando solo standard."""
+
+    ip: str
+    name: Optional[str] = None
+    descr: Optional[str] = None
+    object_id: Optional[str] = None
+    uptime_seconds: Optional[int] = None
+    location: Optional[str] = None
+    contact: Optional[str] = None
+    vendor: Optional[str] = None
+    neighbours: List[SnmpNeighbour] = field(default_factory=list)
+    poe_ports: List[SnmpPoePort] = field(default_factory=list)
+    read_ok: List[str] = field(default_factory=list)
+    read_failed: List[str] = field(default_factory=list)
+
+
+# Enterprise number IANA -> produttore. sysObjectID comincia sempre con
+# 1.3.6.1.4.1.<numero>, e quel numero identifica il produttore in modo
+# inequivocabile: e' molto piu' affidabile che cercare parole dentro sysDescr.
+ENTERPRISE_VENDORS = {
+    "14988": "MikroTik",
+    "11863": "TP-Link",
+    "171": "D-Link",
+    "10002": "EnGenius",
+    "4413": "Broadcom",
+    "9": "Cisco",
+    "41112": "Ubiquiti",
+    "2011": "Huawei",
+    "890": "Zyxel",
+    "4526": "Netgear",
+    "674": "Dell",
+    "311": "Microsoft",
+    "8072": "net-snmp (Linux)",
+}
+
+
+def vendor_from_object_id(object_id: Optional[str]) -> Optional[str]:
+    """Produttore dedotto dall'enterprise number, non da parole nel testo."""
+    if not object_id:
+        return None
+    prefix = "1.3.6.1.4.1."
+    text = str(object_id).strip()
+    if not text.startswith(prefix):
+        return None
+    enterprise = text[len(prefix):].split(".")[0]
+    return ENTERPRISE_VENDORS.get(enterprise, f"enterprise {enterprise}")
+
+
+def ticks_to_seconds(ticks) -> Optional[int]:
+    """sysUpTime e' in centesimi di secondo, non in secondi."""
+    try:
+        return int(ticks) // 100
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_lldp(
+    nomi: Dict[str, str],
+    descrizioni: Dict[str, str],
+    porte: Dict[str, str],
+) -> List[SnmpNeighbour]:
+    """Costruisce l'elenco dei vicini dalle tre tabelle LLDP.
+
+    L'indice di lldpRemTable e' ``<timeMark>.<localPortNum>.<remIndex>``: la
+    porta locale e' il **secondo** campo, non il primo. Sbagliarlo produce un
+    albero plausibile e completamente falso, che e' il tipo di errore peggiore
+    perche' non si nota. Funzione separata apposta per poterla verificare.
+    """
+    vicini: List[SnmpNeighbour] = []
+    for oid, nome in sorted(nomi.items()):
+        suffisso = oid[len(OID_LLDP_REM_SYS_NAME) + 1:]
+        parti = suffisso.split(".")
+        porta_locale = parti[1] if len(parti) >= 2 else "?"
+        vicini.append(
+            SnmpNeighbour(
+                local_port=porta_locale,
+                sys_name=nome or None,
+                sys_desc=descrizioni.get(f"{OID_LLDP_REM_SYS_DESC}.{suffisso}") or None,
+                port_id=porte.get(f"{OID_LLDP_REM_PORT_ID}.{suffisso}") or None,
+            )
+        )
+    return vicini
+
+
+def parse_poe(stati: Dict[str, str], potenze: Dict[str, str]) -> List[SnmpPoePort]:
+    """Stato e assorbimento PoE per porta.
+
+    L'indice e' ``<gruppo>.<porta>``: si tiene intero, perche' su uno chassis
+    con piu' moduli la sola porta non basta a identificarla.
+    """
+    porte: List[SnmpPoePort] = []
+    for oid, stato in sorted(stati.items()):
+        suffisso = oid[len(OID_PETH_PORT_DETECTION) + 1:]
+        try:
+            stato_nome = PETH_STATES.get(int(stato), str(stato))
+        except (TypeError, ValueError):
+            stato_nome = str(stato)
+        potenza = potenze.get(f"{OID_PETH_PORT_POWER}.{suffisso}")
+        porte.append(
+            SnmpPoePort(
+                port=suffisso,
+                state=stato_nome,
+                power_mw=int(potenza) if potenza and str(potenza).isdigit() else None,
+            )
+        )
+    return porte
+
+
+class SnmpClient:
+    """GET e WALK su SNMP v2c. Non solleva: un apparato muto non e' un errore."""
+
+    def __init__(
+        self,
+        host: str,
+        community: str = "public",
+        *,
+        port: int = 161,
+        timeout: float = 2.0,
+        retries: int = 1,
+    ) -> None:
+        self.host = host
+        self.community = community
+        self.port = port
+        self.timeout = timeout
+        self.retries = retries
+
+    async def _target(self):
+        from pysnmp.hlapi.v3arch.asyncio import UdpTransportTarget
+
+        return await UdpTransportTarget.create(
+            (self.host, self.port), timeout=self.timeout, retries=self.retries
+        )
+
+    async def get(self, *oids: str) -> Dict[str, str]:
+        """Legge piu' OID in una richiesta sola. Ritorna {oid: valore}."""
+        from pysnmp.hlapi.v3arch.asyncio import (
+            CommunityData,
+            ContextData,
+            ObjectIdentity,
+            ObjectType,
+            SnmpEngine,
+            get_cmd,
+        )
+
+        try:
+            error_indication, error_status, _, var_binds = await get_cmd(
+                SnmpEngine(),
+                CommunityData(self.community),
+                await self._target(),
+                ContextData(),
+                *[ObjectType(ObjectIdentity(o)) for o in oids],
+            )
+        except Exception as e:
+            logger.debug("SNMP %s: get fallita: %s", self.host, e)
+            return {}
+
+        if error_indication or error_status:
+            logger.debug("SNMP %s: %s %s", self.host, error_indication, error_status)
+            return {}
+
+        risultato = {}
+        for oid, value in var_binds:
+            testo = str(value)
+            # pysnmp restituisce questi segnaposto quando l'OID non esiste
+            if testo in ("", "No Such Object currently exists at this OID",
+                         "No Such Instance currently exists at this OID"):
+                continue
+            risultato[str(oid)] = testo
+        return risultato
+
+    async def walk(self, base_oid: str, limit: int = 256) -> Dict[str, str]:
+        """Percorre una tabella. Ritorna {oid completo: valore}."""
+        from pysnmp.hlapi.v3arch.asyncio import (
+            CommunityData,
+            ContextData,
+            ObjectIdentity,
+            ObjectType,
+            SnmpEngine,
+            bulk_walk_cmd,
+        )
+
+        risultato: Dict[str, str] = {}
+        try:
+            engine = SnmpEngine()
+            target = await self._target()
+            async for error_indication, error_status, _, var_binds in bulk_walk_cmd(
+                engine,
+                CommunityData(self.community),
+                target,
+                ContextData(),
+                0,
+                20,
+                ObjectType(ObjectIdentity(base_oid)),
+                lexicographicMode=False,
+            ):
+                if error_indication or error_status:
+                    break
+                for oid, value in var_binds:
+                    risultato[str(oid)] = str(value)
+                if len(risultato) >= limit:
+                    break
+        except Exception as e:
+            logger.debug("SNMP %s: walk di %s fallita: %s", self.host, base_oid, e)
+        return risultato
+
+
+async def read_device(
+    host: str, community: str = "public", *, timeout: float = 2.0
+) -> Optional[SnmpDeviceInfo]:
+    """Interroga un apparato e ritorna cio' che ha voluto dire.
+
+    None solo se non risponde affatto: in quel caso non parla SNMP, oppure la
+    community e' sbagliata - dal punto di vista del protocollo sono
+    indistinguibili, ed e' bene saperlo quando si legge un log.
+    """
+    client = SnmpClient(host, community, timeout=timeout)
+
+    system = await client.get(
+        OID_SYS_DESCR, OID_SYS_OBJECT_ID, OID_SYS_UPTIME,
+        OID_SYS_CONTACT, OID_SYS_NAME, OID_SYS_LOCATION,
+    )
+    if not system:
+        return None
+
+    info = SnmpDeviceInfo(
+        ip=host,
+        descr=system.get(OID_SYS_DESCR),
+        object_id=system.get(OID_SYS_OBJECT_ID),
+        uptime_seconds=ticks_to_seconds(system.get(OID_SYS_UPTIME)),
+        contact=system.get(OID_SYS_CONTACT) or None,
+        name=system.get(OID_SYS_NAME) or None,
+        location=system.get(OID_SYS_LOCATION) or None,
+    )
+    info.vendor = vendor_from_object_id(info.object_id)
+    info.read_ok.append("system")
+
+    # --- LLDP: l'albero ---
+    nomi = await client.walk(OID_LLDP_REM_SYS_NAME)
+    if nomi:
+        info.read_ok.append("lldp")
+        descrizioni = await client.walk(OID_LLDP_REM_SYS_DESC)
+        porte = await client.walk(OID_LLDP_REM_PORT_ID)
+        info.neighbours = parse_lldp(nomi, descrizioni, porte)
+    else:
+        info.read_failed.append("lldp")
+
+    # --- PoE per porta ---
+    stati = await client.walk(OID_PETH_PORT_DETECTION)
+    if stati:
+        info.read_ok.append("poe")
+        potenze = await client.walk(OID_PETH_PORT_POWER)
+        info.poe_ports = parse_poe(stati, potenze)
+    else:
+        info.read_failed.append("poe")
+
+    return info

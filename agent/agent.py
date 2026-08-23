@@ -49,8 +49,9 @@ class Agent:
         self.presence_task: asyncio.Task | None = None
         # Vuoto in configurazione = ricavato dalle rotte, non indovinato
         self.network = config.SCAN_NETWORK or get_local_network()
-        # Riempito dal driver del router, se configurato.
+        # Riempiti dal driver del router, se configurato.
         self.gateway_info = None
+        self._driver = None
 
     async def run(self) -> None:
         logger.info("NetMonitor Agent starting...")
@@ -179,6 +180,58 @@ class Agent:
             scheme=config.ROUTER_SCHEME,
         )
 
+    def _api_driver(self):
+        from drivers.mikrotik_api import MikroTikApiDriver
+
+        host = config.GATEWAY_IP or get_default_gateway()
+        return MikroTikApiDriver(
+            host,
+            config.ROUTER_USER,
+            config.ROUTER_PASSWORD,
+            timeout=config.ROUTER_TIMEOUT,
+        )
+
+    async def _pick_driver(self):
+        """Sceglie il driver una volta sola, poi lo tiene.
+
+        RouterOS 7 ha il REST, RouterOS 6 no: quale sia in campo si scopre
+        provando, non chiedendolo all'operatore. La scelta viene ricordata,
+        cosi' il tentativo a vuoto si paga una volta e non a ogni ciclo.
+        """
+        if self._driver is not None:
+            return self._driver
+        if config.ROUTER_DRIVER == "none":
+            return None
+        if not (config.ROUTER_USER and config.ROUTER_PASSWORD):
+            return None
+        if not (config.GATEWAY_IP or get_default_gateway()):
+            logger.warning("Nessun gateway rilevato: driver del router non attivabile")
+            return None
+
+        candidates = []
+        if config.ROUTER_DRIVER in ("auto", "mikrotik-rest"):
+            candidates.append(self._gateway_driver())
+        if config.ROUTER_DRIVER in ("auto", "mikrotik-api"):
+            candidates.append(self._api_driver())
+
+        for driver in candidates:
+            if driver is None:
+                continue
+            try:
+                if await driver.probe():
+                    logger.info("Driver del router: %s su %s", driver.name, driver.host)
+                    self._driver = driver
+                    return driver
+            except Exception as e:
+                logger.debug("Driver %s non utilizzabile: %s", driver.name, e)
+
+        logger.error(
+            "Nessun driver riesce a parlare con il router. Verifica utente e "
+            "password, e che sia attivo il REST (RouterOS 7: /ip service enable "
+            "www-ssl con certificato) o l'API (RouterOS 6: /ip service enable api)."
+        )
+        return None
+
     async def _enrich_from_gateway(self, devices, clients):
         """Unisce la scansione con quello che sa il router.
 
@@ -187,7 +240,7 @@ class Agent:
         scansione ARP serve a non perdere chi il router non conosce - un
         dispositivo con IP statico e senza lease, per esempio.
         """
-        driver = self._gateway_driver()
+        driver = await self._pick_driver()
         if driver is None:
             self.gateway_info = None
             return devices, clients

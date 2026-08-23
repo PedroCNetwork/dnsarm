@@ -185,12 +185,29 @@ sudo systemctl restart netmonitor-agent
 Una scansione dalla LAN vede solo **chi risponde**. Lease DHCP, registration-table
 WiFi con il segnale e bridge host table stanno dentro il router: vanno chieste a lui.
 
-Sul MikroTik, una volta sola:
+Come si arriva a quelle tabelle dipende dalla versione di RouterOS, e l'agent lo
+scopre da solo provando: prima il REST, poi l'API binaria. Non devi dirglielo.
+
+**RouterOS 7** — REST, cifrato. Attenzione: `www-ssl` senza certificato accetta la
+connessione ma fallisce l'handshake TLS.
 
 ```
-/ip service enable www-ssl
+/certificate add name=netmonitor common-name=netmonitor days-valid=3650
+/certificate sign netmonitor
+/ip service set www-ssl certificate=netmonitor disabled=no
 /user add name=netmonitor group=read password=SCEGLINE-UNA
 ```
+
+**RouterOS 6** — il REST non esiste, è arrivato con la 7.1. Si usa l'API binaria
+sulla 8728, che non richiede certificati:
+
+```
+/ip service enable api
+/user add name=netmonitor group=read password=SCEGLINE-UNA
+```
+
+Il canale però non è cifrato: le credenziali viaggiano in chiaro sulla LAN. Per un
+utente in sola lettura su una rete che controlli è un compromesso ragionevole.
 
 Il gruppo `read` basta: il driver non scrive nulla. Poi sul box:
 

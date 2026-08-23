@@ -116,14 +116,17 @@ fi
 # ---------------------------------------------------------------------------
 step "Pacchetti"
 export DEBIAN_FRONTEND=noninteractive
-run apt-get update -qq
+# Niente -qq: su una TV box questo passaggio dura minuti, e un comando muto per
+# minuti sembra un comando bloccato. Meglio rumoroso che ambiguo.
+warn "Questo passaggio puo' richiedere diversi minuti su hardware lento. Non interrompere."
+run apt-get update -q
 
 # I pacchetti essenziali vanno in una apt separata da quelli opzionali: apt e'
 # tutto-o-niente, e un solo nome non disponibile fa fallire l'intera chiamata
 # senza installare nulla. Con un `|| warn` sembrerebbe pure andata bene, e poi
 # la creazione del venv fallirebbe senza un motivo evidente.
 PKGS=(python3 python3-venv python3-pip curl ca-certificates iputils-ping unattended-upgrades)
-run apt-get install -y -qq "${PKGS[@]}"
+run apt-get install -y -q "${PKGS[@]}"
 ok "pacchetti essenziali installati"
 
 # Armbian di suo monta /var/log su zram (armbian-ramlog): nella maggior parte
@@ -168,8 +171,21 @@ run chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 if [ ! -x "$APP_DIR/venv/bin/python" ]; then
     run python3 -m venv "$APP_DIR/venv"
 fi
-run "$APP_DIR/venv/bin/pip" install -q --upgrade pip
-run "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+run "$APP_DIR/venv/bin/pip" install --upgrade pip
+
+# --prefer-binary: su ARM a 32 bit alcune dipendenze non hanno una ruota
+# precompilata e pip proverebbe a compilarle. Se succede e manca il
+# compilatore, invece di morire si installano gli strumenti e si riprova una
+# volta sola: sono ~200 MB, quindi non si mettono se non servono davvero.
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf '    [dry-run] pip install -r %s/requirements.txt\n' "$APP_DIR"
+elif ! "$APP_DIR/venv/bin/pip" install --prefer-binary -r "$APP_DIR/requirements.txt"; then
+    warn "Installazione fallita: probabilmente serve compilare. Installo gli strumenti e riprovo."
+    apt-get install -y -q build-essential python3-dev \
+        || die "Impossibile installare build-essential: controlla la connessione."
+    "$APP_DIR/venv/bin/pip" install --prefer-binary -r "$APP_DIR/requirements.txt" \
+        || die "Installazione delle dipendenze fallita anche dopo l'installazione del compilatore."
+fi
 run chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 ok "agent in $APP_DIR"
 

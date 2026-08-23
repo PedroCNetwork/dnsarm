@@ -288,8 +288,12 @@ WantedBy=multi-user.target
 EOF
 fi
 run systemctl daemon-reload
-run systemctl enable --now "$SERVICE"
-ok "servizio $SERVICE attivo"
+run systemctl enable "$SERVICE"
+# restart, non `enable --now`: se il servizio e' gia' in esecuzione `--now` non
+# fa niente, e una reinstallazione lascerebbe in giro il processo vecchio con
+# la unit e il codice vecchi. Sembra riuscita e non ha cambiato nulla.
+run systemctl restart "$SERVICE"
+ok "servizio $SERVICE riavviato"
 
 # ---------------------------------------------------------------------------
 # Accesso remoto: cloudflared
@@ -358,7 +362,8 @@ WantedBy=multi-user.target
 EOF
     fi
     run systemctl daemon-reload
-    run systemctl enable --now cloudflared
+    run systemctl enable cloudflared
+    run systemctl restart cloudflared
     ok "tunnel attivo, token in $CF_ENV_FILE"
 fi
 

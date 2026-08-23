@@ -65,6 +65,32 @@ async def _ping_host(ip: str) -> bool:
         return False
 
 
+async def ping_usable() -> tuple[bool, str]:
+    """Verifica che ping funzioni davvero, prima di fidarsi dei suoi risultati.
+
+    Esiste per un motivo preciso: `_ping_host` restituisce False sia quando
+    l'host non risponde sia quando ping non riesce nemmeno a partire. Con
+    l'agent avviato da systemd con NoNewPrivileges, ping non puo' acquisire
+    CAP_NET_RAW dalla propria file capability e fallisce all'istante: il
+    risultato era "0 host attivi", indistinguibile da una rete davvero vuota.
+    Un ping verso il loopback separa i due casi in mezzo secondo.
+    """
+    if CURRENT_OS == "windows":
+        return True, ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ping", "-c", "1", "-W", "1", "127.0.0.1",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        if proc.returncode == 0:
+            return True, ""
+        return False, (err or b"").decode(errors="replace").strip()
+    except Exception as e:
+        return False, str(e)
+
+
 def _parse_arp_table() -> dict[str, str]:
     """Parse the OS ARP table into a dict {ip: mac}."""
     mapping: dict[str, str] = {}
@@ -254,6 +280,19 @@ def get_uptime_seconds() -> Optional[int]:
 async def discover_network(network_cidr: str) -> List[DiscoveredDevice]:
     """Ping-sweep the given CIDR, enrich with ARP/MAC/hostname/SNMP."""
     logger.info("Starting discovery for %s", network_cidr)
+
+    usable, why = await ping_usable()
+    if not usable:
+        logger.error(
+            "ping non funziona su questa macchina, la scansione e' inutile: %s", why
+        )
+        logger.error(
+            "Se l'agent gira da systemd servono AmbientCapabilities=CAP_NET_RAW e "
+            "CapabilityBoundingSet=CAP_NET_RAW nell'unit, altrimenti NoNewPrivileges "
+            "impedisce a ping di ottenere CAP_NET_RAW."
+        )
+        return []
+
     try:
         net = ipaddress.ip_network(network_cidr, strict=False)
     except ValueError as e:

@@ -264,6 +264,15 @@ Restart=always
 RestartSec=10
 
 # Il box custodisce credenziali dei router dei clienti: vale la pena stringere.
+#
+# CAP_NET_RAW e' indispensabile: ping ottiene il permesso di aprire socket ICMP
+# da una file capability, e NoNewPrivileges impedisce a un figlio di acquisire
+# privilegi in quel modo. Senza queste due righe la scansione fallisce in
+# silenzio e il box riporta "0 host" come se la rete fosse vuota.
+# Concessa dal padre invece che guadagnata dal binario, quindi NoNewPrivileges
+# resta attivo. CapabilityBoundingSet toglie tutto il resto.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

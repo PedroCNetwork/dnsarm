@@ -25,6 +25,10 @@ from config import config
 logger = logging.getLogger(__name__)
 CURRENT_OS = platform.system().lower()
 
+# Porta "discard" (RFC 863): serve solo a dare al kernel un motivo per
+# risolvere l'indirizzo fisico. Nessuno deve rispondere, e infatti non risponde.
+_DISCARD_PORT = 9
+
 
 @dataclass
 class DiscoveredDevice:
@@ -108,23 +112,113 @@ def _parse_arp_table() -> dict[str, str]:
                     ):
                         mapping[ip_candidate] = mac_candidate.replace("-", ":").lower()
         else:
-            # Linux /proc/net/arp
+            # /proc/net/arp: IP, tipo HW, flag, MAC, maschera, interfaccia.
+            # Il bit 0x2 dei flag (ATF_COM) dice che la risoluzione e' andata a
+            # buon fine. Senza questo controllo si prendono anche le voci
+            # "incomplete", cioe' indirizzi interrogati che non hanno mai
+            # risposto: sarebbero dispositivi inventati.
             with open("/proc/net/arp", "r", encoding="utf-8") as f:
-                next(f)  # skip header
+                next(f)  # salta l'intestazione
                 for line in f:
                     parts = line.split()
-                    if len(parts) >= 4 and parts[3] != "00:00:00:00:00:00":
+                    if len(parts) < 4:
+                        continue
+                    try:
+                        complete = int(parts[2], 16) & 0x2
+                    except ValueError:
+                        complete = 0
+                    if complete and parts[3] != "00:00:00:00:00:00":
                         mapping[parts[0]] = parts[3].lower()
     except Exception as e:
         logger.debug("Could not parse ARP table: %s", e)
     return mapping
 
 
+async def arp_sweep(network_cidr: str) -> dict[str, str]:
+    """Scopre i dispositivi via ARP invece che via ping. Ritorna {ip: mac}.
+
+    Perche' ARP e non ICMP: un dispositivo **puo'** ignorare il ping, e molti lo
+    fanno di proposito - telefoni, stampanti, Windows col firewall. Ma **non
+    puo'** ignorare l'ARP, altrimenti non riuscirebbe a comunicare in rete.
+    Misurato sul campo: dove il ping trovava 2 host su 4, ARP li trovava tutti.
+
+    Non serve alcun permesso speciale, e questa e' la parte elegante: si invia
+    un datagramma UDP verso una porta scartata e ci pensa il kernel a risolvere
+    l'indirizzo fisico prima di spedirlo. Nessun socket raw, nessuna capability.
+
+    Limite noto: una voce ARP di un dispositivo appena scollegato resta valida
+    per qualche minuto, quindi un dispositivo puo' comparire poco oltre la sua
+    uscita. Ripulire la cache richiederebbe CAP_NET_ADMIN, che non vogliamo; il
+    campo `last_active` lato backend copre gia' il caso.
+    """
+    try:
+        net = ipaddress.ip_network(network_cidr, strict=False)
+    except ValueError as e:
+        logger.error("Rete non valida %s: %s", network_cidr, e)
+        return {}
+
+    hosts = [str(h) for h in net.hosts()]
+    logger.info("Scansione ARP di %d indirizzi su %s...", len(hosts), network_cidr)
+
+    async def _solicit(targets: List[str], sock) -> List[str]:
+        """Tocca ogni indirizzo, ritorna quelli che non e' riuscita a toccare."""
+        failed: List[str] = []
+        for start in range(0, len(targets), config.ARP_BATCH):
+            for ip in targets[start : start + config.ARP_BATCH]:
+                try:
+                    sock.sendto(b"", (ip, _DISCARD_PORT))
+                except OSError:
+                    # Tipicamente ENOBUFS: la coda del kernel per gli indirizzi
+                    # non ancora risolti e' piena. Non e' un host assente, e'
+                    # una richiesta che non e' proprio partita.
+                    failed.append(ip)
+            await asyncio.sleep(0.05)
+        return failed
+
+    # Socket BLOCCANTE, non bloccante. Con il socket non bloccante il buffer di
+    # invio si riempiva e sendto restituiva EAGAIN sugli ultimi ~30 indirizzi:
+    # scartati in silenzio, e quindi contati come host assenti senza essere mai
+    # stati interrogati. Bloccando, il kernel applica la contropressione da se'.
+    # I datagrammi sono vuoti e le pause fra i lotti danno tempo di smaltire,
+    # quindi in pratica non si blocca mai a lungo.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    still_failed: List[str] = []
+    try:
+        failed = await _solicit(hosts, sock)
+        if failed:
+            # Secondo passaggio: la coda nel frattempo si e' svuotata. Senza
+            # questo, gli indirizzi caduti verrebbero contati come "assenti"
+            # senza essere mai stati interrogati.
+            logger.debug("ARP: %d indirizzi da riprovare", len(failed))
+            await asyncio.sleep(1.0)
+            still_failed = await _solicit(failed, sock)
+            if still_failed:
+                logger.warning(
+                    "ARP: %d indirizzi non interrogati nemmeno al secondo tentativo",
+                    len(still_failed),
+                )
+        sent = len(hosts) - len(still_failed)
+    finally:
+        sock.close()
+
+    # Le risposte ARP arrivano in pochi millisecondi, ma vanno attese.
+    await asyncio.sleep(config.ARP_SETTLE)
+
+    table = _parse_arp_table()
+    found = {ip: mac for ip, mac in table.items() if ip in set(hosts)}
+    logger.info("ARP: %d indirizzi sollecitati, %d dispositivi trovati", sent, len(found))
+    return found
+
+
 def _resolve_hostname(ip: str) -> Optional[str]:
     try:
-        return socket.gethostbyaddr(ip)[0]
+        name = socket.gethostbyaddr(ip)[0]
     except Exception:
         return None
+    # Alcuni resolver, quando non c'e' un record PTR, restituiscono l'indirizzo
+    # stesso. Un "hostname" uguale all'IP non e' un nome: e' rumore in tabella.
+    return None if not name or name == ip else name
 
 
 async def _snmp_get_sysdescr(ip: str) -> Optional[str]:
@@ -277,33 +371,8 @@ def get_uptime_seconds() -> Optional[int]:
         return None
 
 
-async def discover_network(network_cidr: str) -> List[DiscoveredDevice]:
-    """Ping-sweep the given CIDR, enrich with ARP/MAC/hostname/SNMP."""
-    logger.info("Starting discovery for %s", network_cidr)
-
-    usable, why = await ping_usable()
-    if not usable:
-        logger.error(
-            "ping non funziona su questa macchina, la scansione e' inutile: %s", why
-        )
-        logger.error(
-            "Se l'agent gira da systemd servono AmbientCapabilities=CAP_NET_RAW e "
-            "CapabilityBoundingSet=CAP_NET_RAW nell'unit, altrimenti NoNewPrivileges "
-            "impedisce a ping di ottenere CAP_NET_RAW."
-        )
-        return []
-
-    try:
-        net = ipaddress.ip_network(network_cidr, strict=False)
-    except ValueError as e:
-        logger.error("Invalid network %s: %s", network_cidr, e)
-        return []
-
-    hosts = [str(h) for h in net.hosts()]
-    logger.info("Scansione di %d host (max %d ping insieme)...", len(hosts), config.SCAN_CONCURRENCY)
-
-    # Il semaforo non e' prudenza generica: ogni ping e' un fork, e su una TV
-    # box ARM con 1 GB lanciarne 254 insieme manda in swap e rallenta tutto.
+async def _ping_sweep(hosts: List[str]) -> List[str]:
+    """Ripiego ICMP, usato solo se l'ARP non trova nulla."""
     gate = asyncio.Semaphore(config.SCAN_CONCURRENCY)
 
     async def _probe(ip: str) -> bool:
@@ -311,10 +380,42 @@ async def discover_network(network_cidr: str) -> List[DiscoveredDevice]:
             return await _ping_host(ip)
 
     results = await asyncio.gather(*[_probe(ip) for ip in hosts])
-    alive_ips = [ip for ip, alive in zip(hosts, results) if alive]
-    logger.info("Found %d alive hosts", len(alive_ips))
+    return [ip for ip, alive in zip(hosts, results) if alive]
 
-    arp_table = _parse_arp_table()
+
+async def discover_network(network_cidr: str) -> List[DiscoveredDevice]:
+    """Scopre i dispositivi sulla rete e li arricchisce con hostname e SNMP.
+
+    ARP e' la prova primaria di presenza. ICMP resta come ripiego per reti dove
+    l'ARP non e' praticabile - per esempio se il collector non e' sullo stesso
+    dominio di broadcast dei dispositivi.
+    """
+    logger.info("Discovery su %s", network_cidr)
+
+    try:
+        net = ipaddress.ip_network(network_cidr, strict=False)
+    except ValueError as e:
+        logger.error("Rete non valida %s: %s", network_cidr, e)
+        return []
+    hosts = [str(h) for h in net.hosts()]
+
+    arp_table = await arp_sweep(network_cidr)
+    alive_ips = sorted(arp_table, key=lambda ip: tuple(int(p) for p in ip.split(".")))
+
+    if not alive_ips:
+        logger.warning("Nessun dispositivo via ARP: provo con ICMP come ripiego.")
+        usable, why = await ping_usable()
+        if not usable:
+            logger.error("Anche ping non e' utilizzabile: %s", why)
+            logger.error(
+                "Da systemd servono AmbientCapabilities=CAP_NET_RAW e "
+                "CapabilityBoundingSet=CAP_NET_RAW nell'unit, altrimenti "
+                "NoNewPrivileges impedisce a ping di ottenere CAP_NET_RAW."
+            )
+            return []
+        alive_ips = await _ping_sweep(hosts)
+        arp_table = _parse_arp_table()
+        logger.info("Ripiego ICMP: %d host attivi", len(alive_ips))
 
     devices: List[DiscoveredDevice] = []
     for ip in alive_ips:

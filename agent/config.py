@@ -32,9 +32,16 @@ class Config:
     RECONNECT_DELAY: int = int(os.getenv("RECONNECT_DELAY", "5"))
 
     # Scanner settings
-    # Ping simultanei. Ogni ping e' un processo: senza limite un /24 ne genera
-    # 254 insieme, che su un quad Cortex-A7 con 1 GB di RAM significa swap e
-    # scansione piu' lenta di quella limitata. 32 sta largo ovunque.
+    # Indirizzi sollecitati per lotto nella scansione ARP: la coda del kernel
+    # per gli indirizzi non ancora risolti e' limitata, e riversarci dentro un
+    # /24 intero ne fa cadere una parte in silenzio.
+    ARP_BATCH: int = int(os.getenv("ARP_BATCH", "64"))
+    # Secondi di attesa perche' le risposte ARP arrivino e la tabella si popoli.
+    ARP_SETTLE: float = float(os.getenv("ARP_SETTLE", "2.0"))
+
+    # Ping simultanei, solo per il ripiego ICMP. Ogni ping e' un processo:
+    # senza limite un /24 ne genera 254 insieme, che su un quad Cortex-A7 con
+    # 1 GB di RAM significa swap e scansione piu' lenta di quella limitata.
     SCAN_CONCURRENCY: int = int(os.getenv("SCAN_CONCURRENCY", "32"))
     PING_TIMEOUT: float = float(os.getenv("PING_TIMEOUT", "0.8"))
     SNMP_TIMEOUT: float = float(os.getenv("SNMP_TIMEOUT", "1.0"))

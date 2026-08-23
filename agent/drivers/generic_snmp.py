@@ -41,6 +41,10 @@ OID_LLDP_REM_PORT_ID = "1.0.8802.1.1.2.1.4.1.1.7"
 OID_LLDP_REM_PORT_DESC = "1.0.8802.1.1.2.1.4.1.1.8"
 OID_LLDP_REM_SYS_NAME = "1.0.8802.1.1.2.1.4.1.1.9"
 OID_LLDP_REM_SYS_DESC = "1.0.8802.1.1.2.1.4.1.1.10"
+# lldpRemManAddrTable: l'indirizzo di gestione del vicino. Serve perche' un
+# albero costruito sui nomi e' fragile - due apparati usciti di fabbrica hanno
+# lo stesso nome - mentre l'IP identifica una riga del database.
+OID_LLDP_REM_MAN_ADDR = "1.0.8802.1.1.2.1.4.2.1.3"
 
 # --- POWER-ETHERNET-MIB: PoE per porta -------------------------------------
 OID_PETH_PORT_DETECTION = "1.3.6.1.2.1.105.1.1.1.6"
@@ -66,6 +70,9 @@ class SnmpNeighbour:
     sys_desc: Optional[str] = None
     chassis_id: Optional[str] = None
     port_id: Optional[str] = None
+    # Indirizzo di gestione annunciato dal vicino: e' cio' che permette di
+    # collegarlo alla riga giusta del database invece che al nome giusto.
+    mgmt_ip: Optional[str] = None
 
 
 @dataclass
@@ -137,6 +144,7 @@ def parse_lldp(
     nomi: Dict[str, str],
     descrizioni: Dict[str, str],
     porte: Dict[str, str],
+    indirizzi: Optional[Dict[str, str]] = None,
 ) -> List[SnmpNeighbour]:
     """Costruisce l'elenco dei vicini dalle tre tabelle LLDP.
 
@@ -156,9 +164,41 @@ def parse_lldp(
                 sys_name=nome or None,
                 sys_desc=descrizioni.get(f"{OID_LLDP_REM_SYS_DESC}.{suffisso}") or None,
                 port_id=porte.get(f"{OID_LLDP_REM_PORT_ID}.{suffisso}") or None,
+                mgmt_ip=(indirizzi or {}).get(suffisso),
             )
         )
     return vicini
+
+
+def parse_lldp_mgmt_addr(tabella: Dict[str, str]) -> Dict[str, str]:
+    """Estrae {chiave-vicino: indirizzo IP} da lldpRemManAddrTable.
+
+    L'indirizzo non sta nel valore: sta **dentro l'indice** dell'OID, che ha
+    forma ``<timeMark>.<localPort>.<remIndex>.<subtype>.<lunghezza>.<ottetti>``.
+    Con subtype 1 e lunghezza 4 gli ultimi quattro numeri sono l'IPv4.
+
+    La chiave restituita e' ``timeMark.localPort.remIndex``, cioe' la stessa
+    che indicizza lldpRemTable: serve a incollare l'indirizzo al vicino giusto.
+    """
+    per_vicino: Dict[str, str] = {}
+    for oid in tabella:
+        suffisso = oid[len(OID_LLDP_REM_MAN_ADDR) + 1:]
+        parti = suffisso.split(".")
+        # 3 dell'indice + subtype + lunghezza + almeno un ottetto
+        if len(parti) < 6:
+            continue
+        chiave = ".".join(parti[:3])
+        try:
+            subtype, lunghezza = int(parti[3]), int(parti[4])
+        except ValueError:
+            continue
+        if subtype != 1 or lunghezza != 4:
+            continue  # non IPv4: ignorato, non inventato
+        ottetti = parti[5:5 + 4]
+        if len(ottetti) != 4:
+            continue
+        per_vicino[chiave] = ".".join(ottetti)
+    return per_vicino
 
 
 def parse_poe(stati: Dict[str, str], potenze: Dict[str, str]) -> List[SnmpPoePort]:
@@ -319,7 +359,8 @@ async def read_device(
         info.read_ok.append("lldp")
         descrizioni = await client.walk(OID_LLDP_REM_SYS_DESC)
         porte = await client.walk(OID_LLDP_REM_PORT_ID)
-        info.neighbours = parse_lldp(nomi, descrizioni, porte)
+        indirizzi = parse_lldp_mgmt_addr(await client.walk(OID_LLDP_REM_MAN_ADDR))
+        info.neighbours = parse_lldp(nomi, descrizioni, porte, indirizzi)
     else:
         info.read_failed.append("lldp")
 

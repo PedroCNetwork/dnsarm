@@ -37,6 +37,14 @@ class DiscoveredDevice:
     name: Optional[str] = None
     vendor: Optional[str] = None
     model: Optional[str] = None
+    role: Optional[str] = None
+    # sysLocation: se l'apparato e' etichettato, l'etichetta arriva da sola
+    location: Optional[str] = None
+    # Topologia: a chi e' collegato e su quale porta di quello
+    parent_ip: Optional[str] = None
+    uplink_port: Optional[str] = None
+    # snmp | lldp | neighbor | arp: di quanto fidarsi di quello che c'e' sopra
+    identity_source: Optional[str] = None
 
 
 @dataclass

@@ -302,6 +302,74 @@ class Agent:
 
         return list(by_ip.values()), merged_clients
 
+    async def _enrich_from_snmp(self, devices):
+        """Interroga in SNMP gli apparati e ne ricava identita' e albero.
+
+        Solo i device, mai i client: un telefono non parla SNMP e interrogarlo
+        costerebbe un timeout per ogni ciclo senza dare niente.
+
+        Il valore sta tutto qui: e' il passaggio che trasforma "192.168.88.10"
+        in "EnGenius EWS330AP - Magazzino, porta 3 dello switch", e lo fa
+        leggendo standard, non conoscendo le marche.
+        """
+        if not config.SNMP_ENABLED or not devices:
+            return devices
+
+        from drivers.generic_snmp import read_device
+
+        comunita = [c.strip() for c in config.SNMP_COMMUNITIES if c.strip()]
+        per_ip = {d.ip: d for d in devices}
+        gateway = config.GATEWAY_IP or get_default_gateway()
+        letti = 0
+
+        for device in list(devices):
+            info = None
+            for community in comunita:
+                info = await read_device(device.ip, community, timeout=config.SNMP_TIMEOUT)
+                if info is not None:
+                    break
+            if info is None:
+                continue  # non parla SNMP: normale, non e' un errore
+            letti += 1
+
+            device.name = info.name or device.name
+            device.vendor = info.vendor or device.vendor
+            device.location = info.location or device.location
+            if info.descr and not device.model:
+                # sysDescr e' quanto di piu' vicino a un modello si ottenga
+                # parlando solo standard. Su switch e access point contiene
+                # modello e firmware; su un PC contiene il kernel. Si prende la
+                # prima riga: l'estrazione per marca verra' quando serve.
+                device.model = info.descr.splitlines()[0][:64]
+            device.identity_source = "snmp"
+
+            # Ruolo: dedotto solo da prove, non da nomi che "sembrano".
+            if device.ip == gateway:
+                device.role = "gateway"
+            elif info.poe_ports or len({v.local_port for v in info.neighbours}) > 1:
+                # Alimenta PoE, o vede vicini su piu' porte proprie: e' uno switch.
+                device.role = "switch"
+
+            # I vicini annunciati diventano rami dell'albero.
+            for vicino in info.neighbours:
+                if not vicino.mgmt_ip:
+                    continue  # senza indirizzo non si aggancia a una riga
+                figlio = per_ip.get(vicino.mgmt_ip)
+                if figlio is None:
+                    figlio = DiscoveredDevice(ip=vicino.mgmt_ip)
+                    per_ip[vicino.mgmt_ip] = figlio
+                    devices.append(figlio)
+                figlio.parent_ip = device.ip
+                figlio.uplink_port = vicino.local_port
+                figlio.name = figlio.name or vicino.sys_name
+                if vicino.sys_desc and not figlio.model:
+                    figlio.model = vicino.sys_desc[:64]
+                figlio.identity_source = figlio.identity_source or "lldp"
+
+        if letti:
+            logger.info("SNMP: %d apparati su %d hanno risposto", letti, len(devices))
+        return devices
+
     async def _telemetry_loop(self) -> None:
         """Periodically scan the local network and push telemetry to the cloud."""
         # Send first telemetry soon after start
@@ -323,6 +391,7 @@ class Agent:
         logger.info("Raccolta telemetria per %s...", self.network)
         devices, clients = await sweep(self.network)
         devices, clients = await self._enrich_from_gateway(devices, clients)
+        devices = await self._enrich_from_snmp(devices)
 
         sent_devices = await self._post_batch(
             {
@@ -334,6 +403,11 @@ class Agent:
                         "status": "online",
                         "vendor": d.vendor,
                         "model": d.model,
+                        "role": d.role,
+                        "location": d.location,
+                        "parent_ip": d.parent_ip,
+                        "uplink_port": d.uplink_port,
+                        "identity_source": d.identity_source,
                     }
                     for d in devices
                 ],
@@ -421,6 +495,11 @@ class Agent:
                         "name": d.name,
                         "vendor": d.vendor,
                         "model": d.model,
+                        "role": d.role,
+                        "location": d.location,
+                        "parent_ip": d.parent_ip,
+                        "uplink_port": d.uplink_port,
+                        "identity_source": d.identity_source,
                     }
                     for d in devices
                 ]

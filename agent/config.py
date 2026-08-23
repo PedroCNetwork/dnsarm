@@ -61,7 +61,10 @@ class Config:
     # 1 GB di RAM significa swap e scansione piu' lenta di quella limitata.
     SCAN_CONCURRENCY: int = int(os.getenv("SCAN_CONCURRENCY", "32"))
     PING_TIMEOUT: float = float(os.getenv("PING_TIMEOUT", "0.8"))
-    SNMP_TIMEOUT: float = float(os.getenv("SNMP_TIMEOUT", "1.0"))
+    SNMP_TIMEOUT: float = float(os.getenv("SNMP_TIMEOUT", "2.0"))
+    # Interrogazione SNMP degli apparati: da' nome, produttore, posizione e
+    # l'albero LLDP. Si spegne solo se disturba qualcosa in rete.
+    SNMP_ENABLED: bool = os.getenv("SNMP_ENABLED", "true").lower() == "true"
     SNMP_COMMUNITIES: list[str] = os.getenv("SNMP_COMMUNITIES", "public,private").split(",")
 
 

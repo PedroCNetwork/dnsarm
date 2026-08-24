@@ -172,29 +172,84 @@ se niente fosse.
 
 ## 6. Accesso remoto (facoltativo)
 
-Su **[one.dash.cloudflare.com](https://one.dash.cloudflare.com)**:
+Si attiva **da NetMonitor**, senza tornare sul box: il token arriva all'appliance
+insieme all'heartbeat e viene applicato da sola. Sul box non si digita niente.
 
-1. **Networks → Connectors → Cloudflare Tunnels → Create a tunnel**, tipo
-   *Cloudflared*, nome del cliente → **Save**. Copia il token.
-2. Nel tunnel, **Private Network**: aggiungi la LAN del cliente.
-3. **Settings → WARP Client**: includi quella rete nello Split Tunnel.
+### 6.1 Una volta sola per il tuo account
 
-Poi sul box:
+Serve un account Cloudflare gratuito con **Zero Trust** attivato
+([one.dash.cloudflare.com](https://one.dash.cloudflare.com)): la prima volta
+chiede un nome per l'organizzazione — diventa `<nome>.cloudflareaccess.com` — e
+di scegliere il piano **Free** (fino a 50 utenti; chiede una carta ma non
+addebita).
+
+### 6.2 Per ogni sito: creare il tunnel e copiare il token
+
+1. **Networks → Tunnels → Create a tunnel** → tipo **Cloudflared** → nome del
+   cliente (es. `vcaparm`) → **Save**.
+2. Compare la schermata "Install and run a connector" con i comandi per ogni
+   sistema. **Non eseguirli**: serve solo la stringa lunga che segue `--token`,
+   quella che comincia per `eyJ`. Copiala.
+3. La stessa schermata chiede di configurare *Public Hostname* o *Private
+   Network*: si può fare dopo, vedi 6.4. Chiudi pure.
+
+> Il token si ritrova quando serve: **Tunnels → il tuo tunnel → Configure →
+> Install and run a connector**. Se lo perdi puoi rigenerarlo (*Refresh token*),
+> ma il vecchio smette di funzionare e il box va riconfigurato.
+
+### 6.3 Consegnarlo al box
+
+In NetMonitor, pagina del sito → riquadro **Accesso remoto** → incolla il token →
+**Attiva accesso remoto**.
+
+Lo stato passa per *In attesa del box* e diventa **Attivo** entro una trentina di
+secondi, quando il box conferma che Cloudflare ha registrato la connessione. Non
+diventa attivo prima: con un token sbagliato `cloudflared` parte lo stesso e per
+qualche secondo sembra vivo, quindi la conferma è la connessione registrata, non
+il servizio avviato.
+
+Se resta in attesa o va in errore, il motivo è nella UI e sul box:
 
 ```bash
-sudo ./appliance/install.sh \
-  --token <AGENT-TOKEN> --site "Nome Cliente" \
-  --router-user netmonitor --tunnel-token <TOKEN-DEL-TUNNEL>
+cat /run/netmonitor/tunnel-state
+journalctl -u cloudflared -n 30 --no-pager
 ```
 
 **Un tunnel per sito.** Lo stesso token su due clienti li metterebbe nella stessa
-rotta.
+rotta: reti separate, tunnel separati.
 
-Dal tuo portatile o telefono, con l'app **WARP** collegata alla stessa
-organizzazione, raggiungi Winbox e le interfacce web degli apparati.
+### 6.4 Decidere cosa raggiungere
+
+Il tunnel da solo collega il box a Cloudflare: quello che ci passa dentro lo
+decidono le regole del tunnel.
+
+**Tutta la LAN del cliente** (è il modello di WiFiman Teleport, e non serve un
+dominio):
+
+1. Nel tunnel: **Private Network → Add a private network** → la LAN del cliente,
+   es. `192.168.88.0/24`.
+2. **Settings → WARP Client → Device settings → Split Tunnels**: includi quella
+   rete (in modalità *Exclude* va tolta dalle esclusioni; in *Include* va
+   aggiunta).
+3. Dal portatile o dal telefono, app **WARP** collegata alla tua organizzazione:
+   Winbox, WebFig e le interfacce degli apparati rispondono ai loro IP privati.
+
+**Un singolo servizio via browser**, senza WARP: serve un dominio già su
+Cloudflare. Nel tunnel, **Public Hostname → Add**: sottodominio + servizio
+(es. `http://192.168.88.1` per WebFig). Proteggilo con una policy di Access,
+altrimenti è pubblico.
+
+Attenzione a non sovrapporre reti: due clienti entrambi su `192.168.1.0/24` non
+possono stare nella stessa organizzazione WARP con rotte private uguali.
 
 Limite del piano gratuito: **10 GB al mese** di traffico WARP — abbondante per
 gestione, stretto per travasare firmware.
+
+### 6.5 Il metodo vecchio, se preferisci
+
+`install.sh --tunnel-token <TOKEN>` funziona ancora e applica il token subito,
+senza passare dal cloud. Utile quando sei già davanti al box durante la prima
+installazione.
 
 ---
 

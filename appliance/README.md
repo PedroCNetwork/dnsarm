@@ -115,21 +115,26 @@ pubblico dal cliente e non si apre niente sul suo router. Tu ti colleghi con l'a
 
 ### Preparazione, una volta sola
 
-1. Account Cloudflare gratuito, sezione **Zero Trust**
-2. **Networks → Tunnels → Create a tunnel**, tipo *Cloudflared*: ne esce un token
-3. Nel tunnel, **Private Network**: aggiungi la LAN del cliente (es. `192.168.2.0/24`)
-4. **Settings → WARP Client**: crea il profilo e includi quella rete nello Split Tunnel
+1. Account Cloudflare gratuito, sezione **Zero Trust** (chiede un nome per
+   l'organizzazione e il piano *Free*)
+2. **Settings → WARP Client → Split Tunnels**: qui includerai le LAN dei clienti
 
 ### Per ogni sito
 
-```bash
-sudo ./appliance/install.sh \
-  --token <agent-token> --site "Nome Cliente" \
-  --tunnel-token <token-del-tunnel>
-```
+1. **Networks → Tunnels → Create a tunnel**, tipo *Cloudflared*, nome del cliente:
+   dalla schermata di installazione copia solo la stringa dopo `--token` (comincia
+   per `eyJ`). I comandi mostrati lì non servono.
+2. In NetMonitor, pagina del sito → **Accesso remoto** → incolla il token → attiva.
+   Il box lo ritira col primo heartbeat e riferisce se il tunnel è salito: sul posto
+   non si digita niente.
+3. Nel tunnel, **Private Network**: aggiungi la LAN del cliente (es. `192.168.2.0/24`)
+   e includila nello Split Tunnel del profilo WARP.
 
 Un tunnel per sito. Usare lo stesso token su due clienti diversi li metterebbe nella
 stessa rotta: reti separate, tunnel separati.
+
+`install.sh --tunnel-token <token>` resta valido e applica il token subito, senza
+passare dal cloud: comodo quando sei già davanti al box.
 
 ### Limiti, detti prima
 

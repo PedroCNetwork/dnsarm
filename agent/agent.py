@@ -5,9 +5,12 @@ OpenWrt router, MikroTik container, small Linux gateway, Windows PC, etc.).
 It connects outbound to the cloud backend, so it works behind NAT.
 """
 import asyncio
+import errno
 import json
 import logging
+import os
 import sys
+import time
 from urllib.parse import urlencode
 
 import platform
@@ -38,6 +41,70 @@ TELEMETRY_URL = f"{config.BACKEND_URL}/api/v1/sites/agent/telemetry"
 HEARTBEAT_URL = f"{config.BACKEND_URL}/api/v1/sites/agent/heartbeat"
 
 
+def sd_notify(state: str) -> None:
+    """Manda una riga di stato a systemd, se ci stiamo girando dentro.
+
+    Nessuna dipendenza: e' un datagramma su socket unix. Un nome che inizia per
+    '@' e' nello spazio astratto e va passato con un NUL iniziale.
+    """
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(address)
+            sock.sendall(state.encode("utf-8"))
+    except OSError as e:
+        logger.debug("sd_notify(%s) fallita: %s", state, e)
+
+
+
+def descrittori_esauriti(e: BaseException) -> bool:
+    """Vero se l'errore e' "troppi file aperti", anche incartato in un altro.
+
+    httpx e websockets non lasciano passare l'OSError originale: lo avvolgono
+    nei propri errori di connessione, e da fuori un EMFILE sembra un problema
+    di rete come tanti. Qui si guarda la catena delle cause per distinguerli.
+    """
+    visti = set()
+    while e is not None and id(e) not in visti:
+        visti.add(id(e))
+        if isinstance(e, OSError) and e.errno in (errno.EMFILE, errno.ENFILE):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def muori_se_senza_descrittori(e: BaseException, contesto: str) -> None:
+    """Termina il processo quando finiscono i descrittori.
+
+    Non e' un guasto da cui si torna indietro: da quel momento non si apre piu'
+    nessun socket ne' nessun file, e ogni ciclo continua a girare a vuoto
+    fallendo sempre allo stesso punto. Il ciclo di presenza pero' continua a
+    confermare il watchdog - il suo criterio e' che il giro sia stato fatto,
+    non che sia andato a buon fine, ed e' giusto cosi' quando manca la WAN -
+    quindi nessuno abbatte il processo e il servizio resta "active (running)"
+    per ore senza mandare un dato. Meglio morire e farsi riavviare da systemd.
+
+    os._exit e non sys.exit: siamo dentro un task asyncio, dove SystemExit
+    verrebbe messa da parte come una qualunque eccezione e il processo
+    resterebbe vivo lo stesso.
+    """
+    if not descrittori_esauriti(e):
+        return
+    logger.critical(
+        "Descrittori esauriti durante %s (%s): il processo non puo' "
+        "recuperare, esco e lascio che systemd riavvii il servizio",
+        contesto,
+        e,
+    )
+    sd_notify("STOPPING=1")
+    logging.shutdown()
+    os._exit(1)
+
+
 class Agent:
     def __init__(self) -> None:
         self.ws_url = f"{config.WS_URL}?{urlencode({'token': config.AGENT_TOKEN})}"
@@ -48,6 +115,10 @@ class Agent:
         self.keepalive_task: asyncio.Task | None = None
         self.telemetry_task: asyncio.Task | None = None
         self.presence_task: asyncio.Task | None = None
+        # Ultimo giro completato dal ciclo di presenza, riuscito o meno. E' la
+        # prova che il ciclo e' vivo: separata di proposito dall'esito
+        # dell'invio, perche' una WAN giu' non e' un agent bloccato.
+        self.last_presence_tick = time.monotonic()
         # Vuoto in configurazione = ricavato dalle rotte, non indovinato
         self.network = config.SCAN_NETWORK or get_local_network()
         # Riempiti dal driver del router, se configurato.
@@ -68,8 +139,17 @@ class Agent:
         # stesso. E' la stessa scelta fatta nello script RouterOS dopo che un
         # payload malformato aveva fatto risultare offline un sito perfettamente
         # funzionante.
-        self.presence_task = asyncio.create_task(self._presence_loop())
-        self.telemetry_task = asyncio.create_task(self._telemetry_loop())
+        #
+        # Sorvegliati, non lanciati e dimenticati: un create_task il cui
+        # risultato nessuno raccoglie muore in silenzio alla prima eccezione
+        # che sfugge, e il processo resta vivo a fare il solo WebSocket. Da
+        # fuori il servizio e' "active (running)", ma gli heartbeat sono finiti
+        # e il sito e' offline per sempre. E' esattamente cosi' che il box e'
+        # rimasto giu' una notte intera.
+        self.presence_task = self._supervise("presenza", self._presence_loop)
+        self.telemetry_task = self._supervise("telemetria", self._telemetry_loop)
+        sd_notify("READY=1")
+        asyncio.create_task(self._watchdog_loop())
 
         while self.running:
             try:
@@ -98,6 +178,58 @@ class Agent:
                         pass
                     self.keepalive_task = None
 
+    def _supervise(self, nome: str, coro_factory) -> asyncio.Task:
+        """Tiene in vita un ciclo di fondo, riavviandolo se muore.
+
+        Serve perche' l'unico modo in cui questi cicli possono fallire e' quello
+        che non si vede: un'eccezione che sfugge al try interno chiude il task,
+        asyncio la mette da parte e nessuno la legge. Qui invece viene scritta
+        a log e il ciclo riparte.
+        """
+
+        async def custode() -> None:
+            while self.running:
+                try:
+                    await coro_factory()
+                    logger.error("Ciclo %s terminato da solo: riavvio", nome)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as e:
+                    logger.exception("Ciclo %s morto (%s): riavvio", nome, type(e).__name__)
+                await asyncio.sleep(config.RECONNECT_DELAY)
+
+        return asyncio.create_task(custode())
+
+    async def _watchdog_loop(self) -> None:
+        """Conferma a systemd che l'agent lavora davvero, non solo che esiste.
+
+        Senza questo, un processo bloccato resta 'active (running)' e
+        Restart=always non serve a niente: systemd riavvia i processi che
+        muoiono, non quelli che smettono di fare il proprio mestiere. Il
+        criterio e' il giro del ciclo di presenza, non l'esito dell'invio: se
+        la WAN e' giu' l'agent e' comunque sano e non va riavviato.
+        """
+        if not os.environ.get("NOTIFY_SOCKET"):
+            return
+
+        usec = os.environ.get("WATCHDOG_USEC")
+        if not usec:
+            return
+        intervallo = max(int(usec) / 1_000_000 / 2, 5.0)
+        limite = max(config.HEARTBEAT_INTERVAL * 3, 90)
+
+        while self.running:
+            fermo_da = time.monotonic() - self.last_presence_tick
+            if fermo_da < limite:
+                sd_notify("WATCHDOG=1")
+            else:
+                logger.error(
+                    "Ciclo di presenza fermo da %.0fs: lascio scadere il "
+                    "watchdog, systemd riavviera' il servizio",
+                    fermo_da,
+                )
+            await asyncio.sleep(intervallo)
+
     async def _presence_loop(self) -> None:
         """Dice al cloud che il collector e' vivo, indipendentemente dai dati."""
         while self.running:
@@ -105,6 +237,10 @@ class Agent:
                 await self._send_heartbeat()
             except Exception as e:
                 logger.error("Heartbeat fallito: %s", e)
+                muori_se_senza_descrittori(e, "l'heartbeat")
+            # Segnato dopo il tentativo e fuori dal try: quello che conta e' che
+            # il giro sia stato fatto, non che sia andato a buon fine.
+            self.last_presence_tick = time.monotonic()
             await asyncio.sleep(config.HEARTBEAT_INTERVAL)
 
     def heartbeat_payload(self) -> dict:
@@ -401,9 +537,20 @@ class Agent:
         await asyncio.sleep(5)
         while self.running:
             try:
-                await self._send_telemetry()
+                # Limite di durata sul ciclo intero: una scansione che non
+                # torna piu' (ping che non esce, apparato che accetta la
+                # connessione SNMP e non risponde mai) fermerebbe la raccolta
+                # per sempre senza lasciare traccia. Meglio troncare il giro e
+                # rifarlo al prossimo.
+                await asyncio.wait_for(
+                    self._send_telemetry(),
+                    timeout=max(config.TELEMETRY_INTERVAL * 5, 300),
+                )
+            except asyncio.TimeoutError:
+                logger.error("Ciclo di telemetria troppo lungo: troncato")
             except Exception as e:
                 logger.error("Telemetry push failed: %s", e)
+                muori_se_senza_descrittori(e, "il ciclo di telemetria")
             await asyncio.sleep(config.TELEMETRY_INTERVAL)
 
     async def _send_telemetry(self) -> None:
@@ -485,6 +632,7 @@ class Agent:
                 return int(data.get("devices" if label == "device" else "clients", 0))
         except Exception as e:
             logger.error("Invio lotto %s fallito: %s", label, e)
+            muori_se_senza_descrittori(e, "l'invio della telemetria")
             return 0
 
     async def _receive_loop(self, ws: websockets.WebSocketClientProtocol) -> None:

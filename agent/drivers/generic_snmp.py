@@ -296,6 +296,22 @@ def parse_poe(stati: Dict[str, str], potenze: Dict[str, str]) -> List[SnmpPoePor
     return porte
 
 
+def _chiudi_engine(engine) -> None:
+    """Chiude il dispatcher dell'engine SNMP.
+
+    Ogni SnmpEngine apre un socket UDP alla prima richiesta e non lo chiude da
+    se': senza questa riga il processo perde un descrittore per ogni get e per
+    ogni walk. Su un box che interroga due apparati ogni minuto e mezzo il
+    limite arriva in poche ore, e da li' in poi non si apre piu' niente - ne' i
+    socket HTTP dell'heartbeat, ne' i file dei MIB. E' cosi' che l'agent e'
+    rimasto "active (running)" per una notte senza mandare piu' un dato.
+    """
+    try:
+        engine.close_dispatcher()
+    except Exception as e:  # un engine mai aperto non ha nulla da chiudere
+        logger.debug("SNMP: chiusura del dispatcher fallita: %s", e)
+
+
 class SnmpClient:
     """GET e WALK su SNMP v2c. Non solleva: un apparato muto non e' un errore."""
 
@@ -332,9 +348,10 @@ class SnmpClient:
             get_cmd,
         )
 
+        engine = SnmpEngine()
         try:
             error_indication, error_status, _, var_binds = await get_cmd(
-                SnmpEngine(),
+                engine,
                 CommunityData(self.community),
                 await self._target(),
                 ContextData(),
@@ -343,6 +360,8 @@ class SnmpClient:
         except Exception as e:
             logger.debug("SNMP %s: get fallita: %s", self.host, e)
             return {}
+        finally:
+            _chiudi_engine(engine)
 
         if error_indication or error_status:
             logger.debug("SNMP %s: %s %s", self.host, error_indication, error_status)
@@ -370,8 +389,8 @@ class SnmpClient:
         )
 
         risultato: Dict[str, str] = {}
+        engine = SnmpEngine()
         try:
-            engine = SnmpEngine()
             target = await self._target()
             async for error_indication, error_status, _, var_binds in bulk_walk_cmd(
                 engine,
@@ -391,6 +410,8 @@ class SnmpClient:
                     break
         except Exception as e:
             logger.debug("SNMP %s: walk di %s fallita: %s", self.host, base_oid, e)
+        finally:
+            _chiudi_engine(engine)
         return risultato
 
 

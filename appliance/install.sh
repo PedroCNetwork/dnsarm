@@ -299,6 +299,11 @@ else
 Description=NetMonitor appliance agent
 After=network-online.target
 Wants=network-online.target
+# Un limite di avvii qui e' solo un modo per non tornare piu' su: dopo qualche
+# riavvio ravvicinato systemd smetterebbe di provarci e il box resterebbe
+# offline finche' qualcuno non ci mette le mani. Il box e' remoto: si riprova
+# sempre.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -308,6 +313,13 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$APP_DIR/venv/bin/python $APP_DIR/agent.py
 Restart=always
 RestartSec=10
+
+# Restart=always copre il processo che muore, non quello che resta vivo senza
+# lavorare piu'. L'agent conferma il watchdog solo finche' il ciclo di presenza
+# gira: se si blocca, systemd lo abbatte e lo riavvia invece di lasciarlo
+# "active (running)" a fare niente.
+WatchdogSec=180
+NotifyAccess=main
 
 # Il box custodisce credenziali dei router dei clienti: vale la pena stringere.
 #

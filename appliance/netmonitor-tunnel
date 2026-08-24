@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# Applica o rimuove il tunnel Cloudflare sull'appliance. Gira da root.
+#
+#   netmonitor-tunnel                      esegue /run/netmonitor/tunnel-request
+#   netmonitor-tunnel --applica --token-stdin [--hostname nome]
+#   netmonitor-tunnel --rimuovi
+#
+# Perche' esiste: l'agent gira senza privilegi, con NoNewPrivileges=true, e non
+# puo' installare ne' riavviare servizi - giustamente, visto che parla col cloud
+# e coi router dei clienti. Deposita quindi una richiesta in /run/netmonitor e
+# l'unit netmonitor-tunnel.path fa scattare questo script da root.
+#
+# Il contenuto della richiesta arriva da un processo non privilegiato e va
+# trattato come tale: si accetta un'azione fra due e un token che rispetti una
+# forma precisa, niente di piu'. In particolare il token finisce in un
+# EnvironmentFile di systemd, dove una riga in piu' sarebbe una variabile in
+# piu': la validazione qui sotto e' quello che lo impedisce.
+set -euo pipefail
+
+SPOOL=/run/netmonitor
+RICHIESTA="$SPOOL/tunnel-request"
+STATO="$SPOOL/tunnel-state"
+CF_ENV=/etc/netmonitor/cloudflared.env
+CF_BIN=/usr/local/bin/cloudflared
+SERVICE_GROUP=netmonitor
+
+log() { printf '%s netmonitor-tunnel: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+
+# Lo stato e' l'unico modo che ha il box di raccontare com'e' andata: l'agent lo
+# legge e lo spedisce col prossimo heartbeat. Scrittura atomica, altrimenti
+# l'agent puo' leggerne meta'.
+scrivi_stato() {
+    local stato="$1" messaggio="${2:-}"
+    mkdir -p "$SPOOL"
+    local tmp
+    tmp="$(mktemp "$SPOOL/.tunnel-state.XXXXXX")"
+    python3 - "$stato" "$messaggio" > "$tmp" <<'PY'
+import json, sys
+print(json.dumps({"stato": sys.argv[1], "messaggio": sys.argv[2] or None}))
+PY
+    chmod 0640 "$tmp"
+    chgrp "$SERVICE_GROUP" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$STATO"
+    log "stato: $stato ${messaggio:+($messaggio)}"
+}
+
+# Un token buono e' lungo e fatto di caratteri innocui. Tutto il resto si
+# rifiuta senza nemmeno provare: meglio un errore leggibile nel cloud che un
+# EnvironmentFile con dentro una sorpresa.
+valida_token() {
+    local t="$1"
+    if [ "${#t}" -lt 40 ] || [ "${#t}" -gt 4096 ]; then
+        return 1
+    fi
+    case "$t" in
+        *[!A-Za-z0-9._=-]*) return 1 ;;
+    esac
+    return 0
+}
+
+installa_cloudflared() {
+    [ -x "$CF_BIN" ] && return 0
+    local arch url
+    case "$(uname -m)" in
+        armv7l|armv6l) arch=arm ;;
+        aarch64|arm64) arch=arm64 ;;
+        x86_64)        arch=amd64 ;;
+        *) log "architettura $(uname -m) non gestita"; return 1 ;;
+    esac
+    url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch"
+    log "scarico cloudflared per $arch"
+    curl -fsSL "$url" -o /tmp/cloudflared.$$ || return 1
+    install -m 0755 /tmp/cloudflared.$$ "$CF_BIN" || return 1
+    rm -f /tmp/cloudflared.$$
+    return 0
+}
+
+scrivi_unit() {
+    cat > /etc/systemd/system/cloudflared.service <<'EOF'
+[Unit]
+Description=Cloudflare Tunnel (accesso remoto NetMonitor)
+After=network-online.target
+Wants=network-online.target
+# Il box e' remoto: non deve mai smettere di riprovare.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/netmonitor/cloudflared.env
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --token ${TUNNEL_TOKEN}
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+applica() {
+    local token="$1"
+    if ! valida_token "$token"; then
+        scrivi_stato errore "token rifiutato: forma non valida (lunghezza o caratteri)"
+        return 0
+    fi
+    if ! installa_cloudflared; then
+        scrivi_stato errore "installazione di cloudflared fallita (rete o architettura)"
+        return 0
+    fi
+
+    install -d -m 0750 -o root -g "$SERVICE_GROUP" /etc/netmonitor
+    ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$token" > "$CF_ENV" )
+    chown root:root "$CF_ENV"; chmod 0600 "$CF_ENV"
+
+    scrivi_unit
+    systemctl daemon-reload
+    systemctl enable cloudflared >/dev/null 2>&1 || true
+    systemctl restart cloudflared || {
+        scrivi_stato errore "cloudflared non e' partito: $(systemctl is-active cloudflared 2>&1)"
+        return 0
+    }
+
+    # Attivo non basta: con un token sbagliato il servizio parte, fallisce e
+    # viene riavviato, e per qualche secondo sembra vivo. La prova che il
+    # tunnel esiste e' che Cloudflare abbia accettato una connessione.
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 2
+        if journalctl -u cloudflared --since "-90 seconds" --no-pager 2>/dev/null \
+                | grep -qi "Registered tunnel connection"; then
+            scrivi_stato attivo "connettore registrato su Cloudflare"
+            return 0
+        fi
+        systemctl is-active --quiet cloudflared || break
+    done
+
+    local motivo
+    motivo="$(journalctl -u cloudflared --since "-90 seconds" --no-pager 2>/dev/null \
+              | grep -iE "error|failed|unauthorized" | tail -1 | cut -c1-300)"
+    scrivi_stato errore "${motivo:-nessuna connessione registrata entro 20 secondi}"
+}
+
+rimuovi() {
+    systemctl disable --now cloudflared >/dev/null 2>&1 || true
+    rm -f "$CF_ENV"
+    scrivi_stato assente "tunnel disattivato"
+}
+
+# --- ingresso ---------------------------------------------------------------
+AZIONE=""; TOKEN=""; HOSTNAME_TUNNEL=""
+
+if [ $# -eq 0 ]; then
+    # Modo systemd: la richiesta l'ha depositata l'agent.
+    [ -f "$RICHIESTA" ] || { log "nessuna richiesta da eseguire"; exit 0; }
+    eval "$(python3 - "$RICHIESTA" <<'PY'
+import json, shlex, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+except Exception as e:
+    print(f"AZIONE=errore; MOTIVO={shlex.quote(str(e))}")
+    raise SystemExit(0)
+azione = d.get("azione") if d.get("azione") in ("applica", "rimuovi") else "errore"
+print(f"AZIONE={shlex.quote(azione)}")
+print(f"TOKEN={shlex.quote(str(d.get('token') or ''))}")
+print(f"HOSTNAME_TUNNEL={shlex.quote(str(d.get('hostname') or ''))}")
+if azione == "errore":
+    print("MOTIVO='azione non riconosciuta'")
+PY
+)"
+    # Prima di eseguire, non dopo: se qualcosa va storto a meta' non si vuole
+    # ritrovare la stessa richiesta al riavvio successivo, in eterno.
+    rm -f "$RICHIESTA"
+else
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --applica)      AZIONE=applica ;;
+            --rimuovi)      AZIONE=rimuovi ;;
+            --token-stdin)  TOKEN="$(cat)" ;;
+            --hostname)     shift; HOSTNAME_TUNNEL="${1:-}" ;;
+            -h|--help)      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            *) log "opzione sconosciuta: $1"; exit 2 ;;
+        esac
+        shift
+    done
+fi
+
+case "${AZIONE:-}" in
+    applica) applica "$TOKEN" ;;
+    rimuovi) rimuovi ;;
+    errore)  scrivi_stato errore "${MOTIVO:-richiesta illeggibile}" ;;
+    *)       log "niente da fare"; exit 0 ;;
+esac

@@ -44,6 +44,11 @@ class Config:
     # ma spezzare resta utile: un lotto che fallisce non porta via tutto.
     CLIENT_BATCH_SIZE: int = int(os.getenv("CLIENT_BATCH_SIZE", "50"))
 
+    # Secondi prima di ridepositare la stessa richiesta di tunnel. Il cloud la
+    # ripete a ogni heartbeat finche' il connettore non risulta attivo: senza
+    # questa pausa cloudflared verrebbe riavviato ogni trenta secondi.
+    TUNNEL_RETRY: float = float(os.getenv("TUNNEL_RETRY", "300"))
+
     # WS settings
     HEARTBEAT_INTERVAL: int = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
     RECONNECT_DELAY: int = int(os.getenv("RECONNECT_DELAY", "5"))

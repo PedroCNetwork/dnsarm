@@ -19,6 +19,7 @@ import socket
 import httpx
 import websockets
 
+import tunnel
 from config import config
 from scanner import (
     DiscoveredDevice,
@@ -112,6 +113,11 @@ class Agent:
         self.telemetry_url = f"{TELEMETRY_URL}?{token_qs}"
         self.heartbeat_url = f"{HEARTBEAT_URL}?{token_qs}"
         self.running = True
+        # Accesso remoto: firma dell'ultima richiesta depositata e quando, per
+        # non ridepositarla a ogni battito quando il cloud continua a chiederla.
+        self._tunnel_firma: tuple | None = None
+        self._tunnel_quando: float = 0.0
+        self._tunnel_errore: dict | None = None
         self.keepalive_task: asyncio.Task | None = None
         self.telemetry_task: asyncio.Task | None = None
         self.presence_task: asyncio.Task | None = None
@@ -259,7 +265,11 @@ class Agent:
                 "mac": get_local_mac(),
                 "os": f"{platform.system()} {platform.release()}",
                 "uptime_seconds": get_uptime_seconds(),
-            }
+            },
+            # Solo il box puo' dire se il connettore gira davvero: il cloud sa
+            # di aver consegnato un token, non che quel token stia funzionando
+            # in quel locale.
+            "tunnel": self._stato_tunnel(),
         }
 
         gw = getattr(self, "gateway_info", None)
@@ -282,6 +292,59 @@ class Agent:
             resp = await client.post(self.heartbeat_url, json=payload)
             resp.raise_for_status()
             logger.info("Heartbeat ok")
+            # L'accesso remoto viaggia di ritorno sull'heartbeat, non sul
+            # WebSocket: e' il canale che ha retto anche quando il WebSocket
+            # cadeva per ore, ed e' l'unico che un box appena riacceso fa di
+            # sicuro.
+            try:
+                istruzione = (resp.json() or {}).get("tunnel")
+            except Exception:
+                istruzione = None
+        if istruzione:
+            self._esegui_istruzione_tunnel(istruzione)
+
+    def _stato_tunnel(self) -> dict:
+        """Cosa raccontare al cloud dell'accesso remoto su questo box."""
+        if self._tunnel_errore:
+            return self._tunnel_errore
+        return tunnel.stato()
+
+    def _esegui_istruzione_tunnel(self, istruzione: dict) -> None:
+        """Deposita la richiesta per la parte privilegiata, senza insistere.
+
+        Il cloud ripete l'istruzione a ogni battito finche' il tunnel non
+        risulta attivo - cosi' un connettore caduto riparte da solo - ma
+        ridepositare la stessa richiesta ogni trenta secondi riavvierebbe
+        cloudflared in continuazione. Si riprova a intervalli, o subito se
+        l'istruzione e' cambiata.
+        """
+        azione = istruzione.get("azione")
+        if azione not in tunnel.AZIONI:
+            logger.warning("Istruzione di tunnel sconosciuta: %s", azione)
+            return
+
+        if not tunnel.supportato():
+            # Un box installato prima che esistesse questa funzione non ha la
+            # parte privilegiata. Dirlo al cloud e' l'unico modo perche' chi
+            # guarda capisca che deve aggiornare l'appliance, invece di vedere
+            # un "in attesa" che non finisce mai.
+            self._tunnel_errore = {
+                "stato": "errore",
+                "messaggio": "appliance senza supporto per l'accesso remoto: "
+                             "aggiorna il box e rilancia appliance/install.sh",
+            }
+            logger.error("Tunnel chiesto ma /run/netmonitor non esiste: appliance da aggiornare")
+            return
+
+        firma = (azione, istruzione.get("token") or "", istruzione.get("hostname") or "")
+        adesso = time.monotonic()
+        if firma == self._tunnel_firma and adesso - self._tunnel_quando < config.TUNNEL_RETRY:
+            return
+
+        if tunnel.richiedi(azione, istruzione.get("token"), istruzione.get("hostname")):
+            self._tunnel_firma = firma
+            self._tunnel_quando = adesso
+            self._tunnel_errore = None
 
     def _gateway_driver(self):
         """Il driver del router del sito, se e' configurato e riconosciuto.
@@ -650,6 +713,11 @@ class Agent:
             if action == "start_discovery":
                 network = payload.get("network") or self.network
                 asyncio.create_task(self._handle_discovery(ws, network))
+            elif action == "provision_tunnel":
+                # Scorciatoia: la stessa istruzione arriva comunque col prossimo
+                # heartbeat, questa la anticipa di qualche decina di secondi
+                # quando il WebSocket e' vivo.
+                self._esegui_istruzione_tunnel(payload)
             elif action == "ping":
                 await self._send_ws(ws, {"action": "pong", "payload": {}})
             else:

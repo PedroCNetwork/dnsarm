@@ -23,7 +23,6 @@ set -euo pipefail
 
 APP_DIR=/opt/netmonitor
 ENV_FILE=/etc/netmonitor/agent.env
-CF_ENV_FILE=/etc/netmonitor/cloudflared.env
 SERVICE=netmonitor-agent
 SERVICE_USER=netmonitor
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -335,7 +334,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$APP_DIR
+# /run/netmonitor e' la buca delle lettere verso la parte privilegiata: l'agent
+# ci deposita le richieste di tunnel e ci legge l'esito. Senza questa riga
+# ProtectSystem=strict la renderebbe di sola lettura e l'accesso remoto non si
+# attiverebbe mai, in silenzio.
+ReadWritePaths=$APP_DIR /run/netmonitor
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
@@ -354,75 +357,72 @@ run systemctl restart "$SERVICE"
 ok "servizio $SERVICE riavviato"
 
 # ---------------------------------------------------------------------------
-# Accesso remoto: cloudflared
+# Accesso remoto: cloudflared, pilotabile dal cloud
 #
 # Il tunnel esce dall'appliance verso Cloudflare, quindi funziona senza IP
 # pubblico e senza aprire nulla sul router del cliente. Ci si collega con l'app
 # WARP, da portatile o da telefono.
 #
-# L'endpoint della VPN e' il box, non il router: e' il motivo per cui questo
-# funziona uguale con un MikroTik, un TP-Link o la scatola dell'ISP.
+# La parte che conta: il token NON deve piu' passare per forza da qui. L'agent
+# gira senza privilegi e non puo' installare servizi, quindi deposita una
+# richiesta in /run/netmonitor e questa unit .path la fa eseguire da root. Cosi'
+# un tunnel si attiva da NetMonitor, su un box gia' installato e chiuso dentro
+# un locale, senza che nessuno vada a digitarci un comando.
 #
-# Opzionale: senza --tunnel-token il box monitora e basta.
+# --tunnel-token resta valido: e' la stessa strada, percorsa subito.
 # ---------------------------------------------------------------------------
-if [ -n "$TUNNEL_TOKEN" ]; then
-    step "Accesso remoto (cloudflared)"
+step "Accesso remoto"
 
-    # Il nome del binario dipende dall'architettura. Su ARM a 32 bit Cloudflare
-    # non pubblica un pacchetto Debian, solo il binario: va installato a mano e
-    # aggiornato da noi.
-    case "$(uname -m)" in
-        armv7l|armv6l) CF_ARCH=arm ;;
-        aarch64|arm64) CF_ARCH=arm64 ;;
-        x86_64)        CF_ARCH=amd64 ;;
-        *) die "Architettura $(uname -m) non gestita per cloudflared." ;;
-    esac
-    CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH"
+# La buca delle lettere: root scrive e legge, il servizio anche. Sta in /run,
+# quindi e' un tmpfs che si azzera a ogni riavvio - un token non ci resta.
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf '    [dry-run] /etc/tmpfiles.d/netmonitor.conf e /run/netmonitor\n'
+else
+    printf 'd /run/netmonitor 0770 root %s -\n' "$SERVICE_USER" > /etc/tmpfiles.d/netmonitor.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/netmonitor.conf
+fi
 
-    if [ -x /usr/local/bin/cloudflared ]; then
-        ok "cloudflared gia' presente ($(/usr/local/bin/cloudflared --version 2>/dev/null | head -1))"
-    else
-        run curl -fsSL "$CF_URL" -o /tmp/cloudflared
-        run install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
-        run rm -f /tmp/cloudflared
-        ok "cloudflared installato per $CF_ARCH"
-    fi
+run install -m 0755 "$REPO_DIR/appliance/netmonitor-tunnel" /usr/local/sbin/netmonitor-tunnel
 
-    # Il token del tunnel vale quanto una chiave di casa: file a parte, non
-    # dentro l'unit di systemd, che e' leggibile da chiunque.
-    if [ "$DRY_RUN" -eq 1 ]; then
-        printf '    [dry-run] scrittura di %s (0600 root)\n' "$CF_ENV_FILE"
-        printf '    [dry-run] scrittura di /etc/systemd/system/cloudflared.service\n'
-    else
-        umask 077
-        printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > "$CF_ENV_FILE"
-        chown root:root "$CF_ENV_FILE"
-        chmod 0600 "$CF_ENV_FILE"
-
-        cat > /etc/systemd/system/cloudflared.service <<EOF
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf '    [dry-run] unit netmonitor-tunnel.path e .service\n'
+else
+    cat > /etc/systemd/system/netmonitor-tunnel.service <<'EOF'
 [Unit]
-Description=Cloudflare Tunnel (accesso remoto NetMonitor)
-After=network-online.target
-Wants=network-online.target
+Description=Applica la configurazione del tunnel NetMonitor
+# Una richiesta alla volta: due cloudflared riavviati insieme non aiutano nessuno.
 
 [Service]
-Type=notify
-EnvironmentFile=$CF_ENV_FILE
-ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --token \${TUNNEL_TOKEN}
-Restart=always
-RestartSec=10
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
+Type=oneshot
+ExecStart=/usr/local/sbin/netmonitor-tunnel
+EOF
+
+    cat > /etc/systemd/system/netmonitor-tunnel.path <<'EOF'
+[Unit]
+Description=Sorveglia le richieste di tunnel depositate dall'agent
+
+[Path]
+PathExists=/run/netmonitor/tunnel-request
+Unit=netmonitor-tunnel.service
 
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
+run systemctl daemon-reload
+run systemctl enable netmonitor-tunnel.path
+run systemctl restart netmonitor-tunnel.path
+ok "accesso remoto pilotabile dal cloud"
+
+# Con --tunnel-token il tunnel si attiva subito, senza aspettare il cloud.
+if [ -n "$TUNNEL_TOKEN" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '    [dry-run] applicazione immediata del token del tunnel\n'
+    else
+        printf '%s' "$TUNNEL_TOKEN" | /usr/local/sbin/netmonitor-tunnel --applica --token-stdin \
+            || warn "il tunnel non si e' attivato: guarda 'journalctl -u cloudflared'"
     fi
-    run systemctl daemon-reload
-    run systemctl enable cloudflared
-    run systemctl restart cloudflared
-    ok "tunnel attivo, token in $CF_ENV_FILE"
+    ok "token del tunnel applicato"
 fi
 
 # ---------------------------------------------------------------------------
@@ -445,6 +445,10 @@ cat <<EOF
 
     Attesi entro un minuto: "Heartbeat ok" e "Ciclo completato".
     Il sito deve comparire online in NetMonitor.
+
+    L'accesso remoto ora si attiva da NetMonitor, senza tornare qui: incolla
+    il token del connettore Cloudflare nella pagina del sito. Il box lo ritira
+    al primo heartbeat e riferisce se il tunnel e' salito.
 
     ${YELLOW}SSH non e' stato irrigidito${OFF}: si fa in A2, quando la VPN
     funziona e hai una seconda via d'ingresso.

@@ -141,6 +141,36 @@ shell e sarebbe visibile a chiunque faccia `ps`.
 Il passaggio dei pacchetti dura diversi minuti su hardware lento. **Non
 interrompere**: `apt` a metà lascia il sistema in uno stato scomodo da sbrogliare.
 
+### 4.1 L'ordine di avvio, finché sei davanti al box
+
+Sulle TV box Rockchip u-boot prova spesso `pxe` e `dhcp` **prima** della eMMC:
+con il cavo di rete staccato ogni accensione si porta dietro il timeout della
+rete, e su alcune build alla scheda non ci arriva proprio. Dopo un blackout, con
+lo switch ancora spento, il box resta al buio e non è un guasto dell'agent.
+
+Guarda com'è messo (non tocca niente):
+
+```bash
+sudo netmonitor-boot-mmc
+```
+
+Se compare `c'è la rete nell'ordine di avvio`, correggilo **adesso che sei sul
+posto**, non da remoto:
+
+```bash
+sudo netmonitor-boot-mmc --applica     # oppure install.sh --correggi-avvio
+```
+
+Poi provalo davvero: stacca il cavo di rete, spegni e riaccendi. Deve arrivare
+al login senza aspettare la rete. Se qualcosa va storto, `--ripristina` rimette
+la configurazione precedente dalla copia di sicurezza.
+
+Se lo script dice che manca `/etc/fw_env.config`, si ferma di proposito: quel
+file dice a quale offset della eMMC vive l'ambiente di u-boot, e scriverlo
+sbagliato non dà errore — sovrascrive il bootloader. In quel caso la correzione
+si fa da u-boot, con seriale o tastiera: `setenv boot_targets "mmc0 mmc1 usb0";
+saveenv; reset`.
+
 ---
 
 ## 5. Verificare
@@ -279,6 +309,9 @@ Le note sono il posto per le cose che nessun protocollo ti dirà mai:
 | `0 dispositivi trovati` | scansione senza permessi | verifica che l'unit abbia `AmbientCapabilities=CAP_NET_RAW`; rilancia l'installer |
 | Il servizio **non riparte** dopo un aggiornamento | vecchia versione dell'installer | `git pull` e rilancia: ora fa `systemctl restart` esplicito |
 | Un apparato compare **due volte** | riga vecchia a database | si autocorregge al ciclo successivo dopo l'aggiornamento del backend |
+| Dopo un **blackout** il sito resta offline | il box è ripartito prima del router: nessun lease DHCP, nessuna rete rilevata, e senza RTC l'orologio sbagliato fa fallire il TLS | ci pensa `netmonitor-riavvio`, che aspetta rete e ora vere e riavvia l'agent; per vedere cosa sa: `sudo netmonitor-riavvio --stato` |
+| Il box **non si accende più** dopo un blackout | u-boot prova la rete prima della eMMC | `sudo netmonitor-boot-mmc` (passo 4.1), da fare stando davanti al box |
+| `Nessuna rete da scansionare` nel log | l'agent è partito senza rotta di default | si ricorregge da solo al giro di telemetria successivo; se resta, `sudo netmonitor-riavvio --stato` |
 
 ### La diagnosi che risponde in dieci secondi
 
@@ -321,5 +354,8 @@ riavvia il servizio.
 | Log | `journalctl -u netmonitor-agent -f` |
 | Riavvio | `sudo systemctl restart netmonitor-agent` |
 | Stato | `systemctl status netmonitor-agent` |
+| Ripresa dopo il blackout | `sudo netmonitor-riavvio --stato` |
+| Controllo periodico | `systemctl list-timers netmonitor-controllo.timer` |
+| Ordine di avvio (eMMC, non rete) | `sudo netmonitor-boot-mmc` |
 
 Dopo ogni modifica a `agent.env` serve un riavvio del servizio.

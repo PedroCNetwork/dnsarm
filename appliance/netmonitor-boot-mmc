@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+#
+# Ordine di avvio dell'appliance: prima la eMMC, mai la rete. Gira da root.
+#
+#   netmonitor-boot-mmc                 diagnosi: dice cosa c'e' e cosa farebbe
+#   netmonitor-boot-mmc --applica       toglie pxe/dhcp dall'ordine di avvio
+#   netmonitor-boot-mmc --ripristina    rimette l'ultima copia di sicurezza
+#
+# IL GUASTO
+#
+# Con il cavo di rete staccato la board prova ad avviarsi dalla scheda di rete
+# invece che dalla eMMC. E' u-boot che scorre `boot_targets`: se l'elenco
+# contiene `pxe` o `dhcp`, ogni avvio senza collegamento si porta dietro il
+# timeout del DHCP, e su alcune build il fallback alla eMMC non arriva affatto.
+# Dopo un blackout con lo switch ancora spento, il box resta al buio.
+#
+# LA CURA
+#
+# `boot_targets` senza `pxe` e senza `dhcp`. Si prova per due strade, in ordine:
+#
+#   A. fw_setenv, quando esiste /etc/fw_env.config. E' la via pulita: scrive
+#      l'ambiente dove u-boot lo legge davvero.
+#   B. /boot/boot.cmd, che u-boot esegue quando ha gia' trovato la eMMC. Corregge
+#      l'elenco e lo salva con saveenv, cosi' l'avvio successivo parte gia' bene.
+#
+# COSA NON FA, MAI
+#
+# Non scrive /etc/fw_env.config da solo. Quel file dice a quale offset della
+# eMMC vive l'ambiente di u-boot: sbagliarlo non da' un errore, sovrascrive il
+# bootloader. Se non c'e', questo script lo dice e si ferma - un box che non
+# riparte non e' una regressione, e' una trasferta con un lettore di schede.
+set -euo pipefail
+
+BOOT_TARGETS="mmc0 mmc1 usb0"
+BACKUP_DIR=/var/backups/netmonitor
+MARCATORE="# netmonitor: ordine di avvio"
+BOOT_CMD=/boot/boot.cmd
+BOOT_SCR=/boot/boot.scr
+
+if [ -t 1 ]; then
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
+else
+    RED=; GREEN=; YELLOW=; BOLD=; OFF=
+fi
+step() { printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
+ok()   { printf '    %sOK%s   %s\n' "$GREEN" "$OFF" "$1"; }
+warn() { printf '    %sATT%s  %s\n' "$YELLOW" "$OFF" "$1"; }
+die()  { printf '\n    %sKO%s   %s\n\n' "$RED" "$OFF" "$1" >&2; exit 1; }
+
+AZIONE=diagnosi
+case "${1:-}" in
+    "")            ;;
+    --applica)     AZIONE=applica ;;
+    --ripristina)  AZIONE=ripristina ;;
+    -h|--help)     awk 'NR>1 { if (/^#/) { sub(/^# ?/,""); print } else exit }' "$0"; exit 0 ;;
+    *)             die "opzione sconosciuta: $1" ;;
+esac
+[ "$(id -u)" -eq 0 ] || [ "$AZIONE" = diagnosi ] || die "Serve root: rilancia con sudo."
+
+# --- cosa c'e' ----------------------------------------------------------------
+
+env_leggibile() {
+    command -v fw_printenv >/dev/null 2>&1 && [ -r /etc/fw_env.config ] \
+        && fw_printenv >/dev/null 2>&1
+}
+
+targets_attuali() {
+    fw_printenv boot_targets 2>/dev/null | sed 's/^boot_targets=//' || true
+}
+
+# Si tolgono le voci di rete e si tiene l'ordine del resto: la board sa gia' da
+# quali supporti puo' partire, non e' compito di questo script inventarne di
+# nuovi. Se dopo il filtro non resta niente, si usa l'elenco predefinito.
+senza_rete() {
+    local risultato=""
+    for voce in $1; do
+        case "$voce" in
+            pxe|dhcp|bootp|nfs|net|ethernet) continue ;;
+        esac
+        risultato="${risultato:+$risultato }$voce"
+    done
+    printf '%s' "$risultato"
+}
+
+mkimage_arch() {
+    case "$(uname -m)" in
+        aarch64|arm64) printf 'arm64' ;;
+        *)             printf 'arm' ;;
+    esac
+}
+
+diagnosi() {
+    step "Scheda"
+    if [ -r /proc/device-tree/model ]; then
+        printf '    modello:    %s\n' "$(tr -d '\0' < /proc/device-tree/model)"
+    fi
+    printf '    radice su:  %s\n' "$(findmnt -no SOURCE / 2>/dev/null || echo '?')"
+
+    step "Ambiente di u-boot"
+    if env_leggibile; then
+        local attuali; attuali="$(targets_attuali)"
+        if [ -z "$attuali" ]; then
+            warn "l'ambiente si legge ma non contiene boot_targets"
+            warn "questa u-boot non usa distro_bootcmd: la strada A non serve a niente"
+        else
+            printf '    boot_targets: %s\n' "$attuali"
+            case "$attuali" in
+                *pxe*|*dhcp*|*bootp*) warn "c'e' la rete nell'ordine di avvio: e' questo il guasto" ;;
+                *) ok "nessuna voce di rete nell'ordine di avvio" ;;
+            esac
+        fi
+    elif ! command -v fw_printenv >/dev/null 2>&1; then
+        warn "fw_printenv assente (pacchetto u-boot-tools non installato)"
+    elif [ ! -r /etc/fw_env.config ]; then
+        warn "/etc/fw_env.config assente: non si sa dove vive l'ambiente di u-boot"
+        warn "non verra' indovinato: scriverlo all'offset sbagliato distrugge il bootloader"
+    else
+        warn "/etc/fw_env.config c'e' ma fw_printenv non riesce a leggere l'ambiente"
+    fi
+
+    step "Script di avvio"
+    if [ -f "$BOOT_CMD" ]; then
+        if grep -q "$MARCATORE" "$BOOT_CMD"; then
+            ok "$BOOT_CMD gia' corretto da questo script"
+        else
+            ok "$BOOT_CMD presente: la strada B e' percorribile"
+        fi
+        [ -f "$BOOT_SCR" ] || warn "manca $BOOT_SCR: la board potrebbe usare extlinux"
+    elif [ -f /boot/extlinux/extlinux.conf ]; then
+        warn "questa board usa extlinux, non boot.scr: la strada B non si applica"
+    else
+        warn "ne' $BOOT_CMD ne' extlinux.conf: avvio non riconosciuto"
+    fi
+    command -v mkimage >/dev/null 2>&1 || warn "mkimage assente (pacchetto u-boot-tools)"
+
+    step "Cosa farebbe --applica"
+    if env_leggibile && [ -n "$(targets_attuali)" ]; then
+        printf '    A) fw_setenv boot_targets "%s"\n' "$(senza_rete "$(targets_attuali)")"
+    elif [ -f "$BOOT_CMD" ]; then
+        printf '    B) aggiunge a %s la correzione di boot_targets e ricompila %s\n' "$BOOT_CMD" "$BOOT_SCR"
+    else
+        printf '    niente: nessuna delle due strade e'\'' disponibile su questa board\n'
+        printf '    la correzione va fatta da u-boot, con seriale o tastiera:\n'
+        printf '        setenv boot_targets "%s"; saveenv; reset\n' "$BOOT_TARGETS"
+    fi
+    printf '\n'
+}
+
+# --- strada A: l'ambiente di u-boot -------------------------------------------
+
+applica_env() {
+    local attuali nuovi
+    attuali="$(targets_attuali)"
+    nuovi="$(senza_rete "$attuali")"
+    [ -n "$nuovi" ] || nuovi="$BOOT_TARGETS"
+
+    if [ "$attuali" = "$nuovi" ]; then
+        ok "boot_targets gia' senza voci di rete: $attuali"
+        return 0
+    fi
+
+    install -d -m 0700 "$BACKUP_DIR"
+    local copia="$BACKUP_DIR/uboot-env-$(date +%Y%m%d-%H%M%S).txt"
+    fw_printenv > "$copia" 2>/dev/null || die "impossibile salvare una copia dell'ambiente: non tocco niente"
+    ok "copia dell'ambiente in $copia"
+
+    fw_setenv boot_targets "$nuovi" || die "fw_setenv fallito: l'ambiente e' rimasto com'era"
+
+    local riletti; riletti="$(targets_attuali)"
+    [ "$riletti" = "$nuovi" ] || die "riletto '$riletti' invece di '$nuovi': verifica /etc/fw_env.config"
+    ok "boot_targets: $attuali  ->  $nuovi"
+}
+
+# --- strada B: lo script di avvio ---------------------------------------------
+
+applica_boot_cmd() {
+    command -v mkimage >/dev/null 2>&1 || {
+        warn "mkimage assente, provo a installare u-boot-tools"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q u-boot-tools \
+            || die "u-boot-tools non installabile: senza mkimage boot.scr non si ricompila"
+    }
+
+    if grep -q "$MARCATORE" "$BOOT_CMD"; then
+        ok "$BOOT_CMD gia' corretto"
+    else
+        install -d -m 0700 "$BACKUP_DIR"
+        local stampo; stampo="$(date +%Y%m%d-%H%M%S)"
+        cp -a "$BOOT_CMD" "$BACKUP_DIR/boot.cmd-$stampo"
+        [ -f "$BOOT_SCR" ] && cp -a "$BOOT_SCR" "$BACKUP_DIR/boot.scr-$stampo"
+        ok "copia di boot.cmd e boot.scr in $BACKUP_DIR"
+
+        # In testa, prima di qualunque altra cosa. saveenv sta dentro un `if`
+        # perche' in hush un comando che fallisce fuori da una condizione
+        # interrompe il resto dello script: su una u-boot senza ambiente
+        # scrivibile, un saveenv nudo impedirebbe l'avvio. Dentro l'if, al
+        # massimo stampa una riga e si tira avanti.
+        local tmp; tmp="$(mktemp)"
+        cat > "$tmp" <<EOF
+$MARCATORE (aggiunto da netmonitor-boot-mmc, non rimuovere)
+# Senza questo u-boot prova pxe/dhcp prima della eMMC: a cavo staccato ogni
+# avvio si porta dietro il timeout della rete, e a volte non arriva mai a
+# leggere la scheda. Si corregge una volta sola, poi saveenv lo rende stabile.
+if test "\${boot_targets}" != "$BOOT_TARGETS"; then
+  setenv boot_targets "$BOOT_TARGETS"
+  if saveenv; then
+    echo "netmonitor: ordine di avvio corretto in $BOOT_TARGETS"
+  else
+    echo "netmonitor: saveenv non disponibile, correzione valida solo per questo avvio"
+  fi
+fi
+
+EOF
+        cat "$BOOT_CMD" >> "$tmp"
+        cat "$tmp" > "$BOOT_CMD"
+        rm -f "$tmp"
+        ok "correzione aggiunta in testa a $BOOT_CMD"
+    fi
+
+    mkimage -C none -A "$(mkimage_arch)" -T script -d "$BOOT_CMD" "$BOOT_SCR" >/dev/null \
+        || die "mkimage fallito: $BOOT_SCR NON e' stato riscritto"
+    sync
+    ok "$BOOT_SCR ricompilato"
+}
+
+applica() {
+    if env_leggibile && [ -n "$(targets_attuali)" ]; then
+        step "Strada A: ambiente di u-boot"
+        applica_env
+    elif [ -f "$BOOT_CMD" ]; then
+        step "Strada B: script di avvio"
+        applica_boot_cmd
+    else
+        die "nessuna strada disponibile: lancia la diagnosi e leggi cosa manca"
+    fi
+    printf '\n    %sFatto.%s La correzione vale dal prossimo avvio.\n' "$BOLD" "$OFF"
+    printf '    Provala quando puoi essere davanti al box: stacca il cavo di rete,\n'
+    printf '    spegni e riaccendi. Deve arrivare al login senza aspettare la rete.\n\n'
+}
+
+ripristina() {
+    local env_copia cmd_copia
+    env_copia="$(ls -1t "$BACKUP_DIR"/uboot-env-*.txt 2>/dev/null | head -1 || true)"
+    cmd_copia="$(ls -1t "$BACKUP_DIR"/boot.cmd-* 2>/dev/null | head -1 || true)"
+
+    if [ -n "$cmd_copia" ]; then
+        cp -a "$cmd_copia" "$BOOT_CMD"
+        mkimage -C none -A "$(mkimage_arch)" -T script -d "$BOOT_CMD" "$BOOT_SCR" >/dev/null \
+            || die "mkimage fallito durante il ripristino: $BOOT_SCR e' incoerente con $BOOT_CMD"
+        sync
+        ok "ripristinato $BOOT_CMD da $cmd_copia"
+    elif [ -n "$env_copia" ]; then
+        local vecchi; vecchi="$(sed -n 's/^boot_targets=//p' "$env_copia" | head -1)"
+        [ -n "$vecchi" ] || die "la copia $env_copia non contiene boot_targets"
+        fw_setenv boot_targets "$vecchi" || die "fw_setenv fallito"
+        ok "boot_targets riportato a: $vecchi"
+    else
+        die "nessuna copia di sicurezza in $BACKUP_DIR"
+    fi
+}
+
+case "$AZIONE" in
+    diagnosi)   diagnosi ;;
+    applica)    diagnosi; applica ;;
+    ripristina) ripristina ;;
+esac

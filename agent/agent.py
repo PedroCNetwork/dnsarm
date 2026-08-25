@@ -618,6 +618,17 @@ class Agent:
 
     async def _send_telemetry(self) -> None:
         if not self.network:
+            # Rilevata all'avvio, ma l'avvio puo' capitare nel momento sbagliato:
+            # dopo un blackout il box e il router si riaccendono insieme e il box
+            # e' pronto per primo, senza lease DHCP e senza rotta di default.
+            # Tenuta buona quella prima risposta vuota, il servizio resterebbe
+            # "active (running)" per sempre senza scansionare niente. Si ritenta
+            # a ogni giro finche' una rotta non compare.
+            self.network = config.SCAN_NETWORK or get_local_network()
+            if self.network:
+                logger.info("Rete rilevata dopo l'avvio: %s", self.network)
+
+        if not self.network:
             logger.error(
                 "Nessuna rete da scansionare: imposta SCAN_NETWORK nel file .env"
             )

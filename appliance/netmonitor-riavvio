@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+#
+# Ripresa dell'appliance NetMonitor dopo uno spegnimento improvviso. Gira da root.
+#
+#   netmonitor-riavvio --avvio        una volta per avvio, quando la rete c'e'
+#   netmonitor-riavvio --controllo    ogni 5 minuti dal timer
+#   netmonitor-riavvio --spegnimento  segna che lo spegnimento e' stato pulito
+#   netmonitor-riavvio --stato        racconta cosa sa e cosa farebbe, non tocca niente
+#
+# PERCHE' ESISTE
+#
+# `Restart=always` e il watchdog di systemd coprono il processo che muore o che
+# si blocca. Non coprono il caso del blackout, che e' diverso: quando torna la
+# corrente il box e il router del cliente si riaccendono insieme, e il box e'
+# pronto per primo. L'agent parte, non trova ne' lease DHCP ne' rotta di
+# default, e da li' in poi il servizio e' "active (running)" mentre il sito
+# resta muto. Nessun processo e' morto, quindi nessuno lo riavvia.
+#
+# Allo stesso avvio si somma l'orologio: la RK322x non ha batteria tampone,
+# riparte con la data della compilazione e finche' l'NTP non sincronizza ogni
+# handshake TLS verso il backend fallisce perche' il certificato "non e' ancora
+# valido". Anche questo non uccide nessun processo.
+#
+# Questo script aspetta che le due condizioni siano vere e solo allora riavvia
+# l'agent, una volta, con una rete e un orologio veri sotto i piedi.
+#
+# COSA NON FA, DI PROPOSITO
+#
+# Non riavvia niente quando la WAN e' giu'. Un box che non raggiunge il cloud
+# perche' la linea del cliente e' caduta e' un box sano: e' la stessa scelta
+# fatta nel watchdog dell'agent, che conferma il giro fatto e non il giro
+# riuscito. Il criterio per intervenire e' sempre una prova di guasto locale.
+set -euo pipefail
+
+SERVIZIO=netmonitor-agent
+ENV_FILE=/etc/netmonitor/agent.env
+CF_ENV=/etc/netmonitor/cloudflared.env
+STATO_DIR=/var/lib/netmonitor
+MARCATORE="$STATO_DIR/in-esecuzione"
+CONTATORE="$STATO_DIR/guasti"
+ULTIMO_RIAVVIO="$STATO_DIR/ultimo-riavvio-forzato"
+
+# Quanto si aspetta il router del cliente prima di dichiararlo assente. Un
+# MikroTik con un AP dietro ci mette un paio di minuti a distribuire lease dopo
+# che e' tornata la corrente: aspettarlo costa niente, non aspettarlo costa una
+# telemetria vuota fino al prossimo intervento umano.
+ATTESA_RETE=300
+ATTESA_ORA=180
+ATTESA_PROVA=150
+# Tre controlli consecutivi a vuoto (il timer batte ogni 5 minuti) prima di
+# arrivare al riavvio della macchina, e mai piu' di uno ogni sei ore: un box che
+# si riavvia in cerchio e' peggio di un box fermo, perche' non lascia neanche il
+# tempo di collegarsi a guardare.
+GUASTI_PER_RIAVVIO=3
+DISTANZA_RIAVVII=21600
+
+log() { printf 'netmonitor-riavvio: %s\n' "$*" >&2; }
+
+# --- fatti, senza effetti -----------------------------------------------------
+
+backend_url() {
+    # Il file e' 0640 root:netmonitor e contiene il token del sito: si legge
+    # solo la riga che serve, senza importare l'intero file nell'ambiente.
+    sed -n 's/^BACKEND_URL=//p' "$ENV_FILE" 2>/dev/null | head -1
+}
+
+# Letto dalle rotte e convertito in bash: su Armbian minimale awk e' mawk, che
+# non ha strtonum, e `ip route` puo' non esserci in un ambiente ridotto.
+gateway_ip() {
+    local gw
+    gw="$(awk '$2=="00000000" {print $3; exit}' /proc/net/route 2>/dev/null || true)"
+    [ "${#gw}" -eq 8 ] || return 0
+    printf '%d.%d.%d.%d' \
+        "$((0x${gw:6:2}))" "$((0x${gw:4:2}))" "$((0x${gw:2:2}))" "$((0x${gw:0:2}))"
+}
+
+# LAN pronta = c'e' una rotta di default e il gateway risponde. La sola rotta non
+# basta: dopo un blackout puo' esserci un lease vecchio e un router ancora in
+# avvio, e la differenza fra le due cose e' tutta la telemetria del sito.
+rete_pronta() {
+    local gw; gw="$(gateway_ip)"
+    [ -n "$gw" ] || return 1
+    ping -c 1 -W 2 "$gw" >/dev/null 2>&1
+}
+
+wan_pronta() {
+    local url; url="$(backend_url)"
+    [ -n "$url" ] || return 1
+    curl -fsS --max-time 15 "$url/health" >/dev/null 2>&1
+}
+
+ora_credibile() {
+    # Due prove: quella di systemd quando c'e', e in ogni caso l'anno. Un box
+    # ripartito senza RTC dice 1970 o la data dell'immagine, e con quella nessun
+    # certificato del backend risulta ancora valido.
+    [ "$(date -u +%Y)" -ge 2024 ] || return 1
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$' && return 0
+        # timesyncd assente o disattivo: l'anno buono basta come prova.
+        systemctl is-enabled systemd-timesyncd >/dev/null 2>&1 || return 0
+        return 1
+    fi
+    return 0
+}
+
+# Righe recenti del servizio. Vuoto non vuol dire "fermo": su Armbian il journal
+# sta in RAM e dopo un riavvio non sa niente del passato. Chi chiama distingue.
+righe_agent() {
+    journalctl -u "$SERVIZIO" --since "-${1}min" --no-pager 2>/dev/null || true
+}
+
+# 0 = lavora, 1 = non lavora, 2 = non si sa (journal muto)
+agent_lavora() {
+    local minuti="${1:-10}" righe
+    righe="$(righe_agent "$minuti")"
+    [ -n "$righe" ] || return 2
+    grep -qE "Heartbeat ok|Ciclo completato" <<<"$righe" && return 0
+    return 1
+}
+
+# L'agent rileva la rete una volta, all'avvio. Se in quel momento non c'era
+# rotta, lo scrive a chiare lettere e non ci torna piu' sopra: quella riga nel
+# log dell'avvio corrente e' la prova che va riavviato adesso che la rete c'e'.
+agent_senza_rete() {
+    # Dall'ultimo avvio del servizio, non dall'avvio della macchina: dopo un
+    # riavvio dell'agent la vecchia riga resta nel journal, e leggerla come
+    # attuale vorrebbe dire riavviarlo di nuovo ogni cinque minuti per un
+    # guasto gia' riparato.
+    local da
+    da="$(systemctl show -p ActiveEnterTimestamp --value "$SERVIZIO" 2>/dev/null || true)"
+    if [ -n "$da" ]; then
+        journalctl -u "$SERVIZIO" --since "$da" --no-pager 2>/dev/null | grep -q "NON RILEVATA"
+    else
+        journalctl -u "$SERVIZIO" -b --no-pager 2>/dev/null | grep -q "NON RILEVATA"
+    fi
+}
+
+descrittori_agent() {
+    local pid; pid="$(systemctl show -p MainPID --value "$SERVIZIO" 2>/dev/null || echo 0)"
+    [ "${pid:-0}" -gt 0 ] || { echo 0; return; }
+    ls "/proc/$pid/fd" 2>/dev/null | wc -l
+}
+
+root_sola_lettura() {
+    findmnt -no OPTIONS / 2>/dev/null | grep -qE '(^|,)ro(,|$)'
+}
+
+# --- effetti ------------------------------------------------------------------
+
+# L'orologio, quando l'NTP non ce la fa. Si legge la data dalla risposta HTTP
+# del backend: in chiaro di proposito, perche' in https il certificato non
+# sarebbe ancora valido ed e' esattamente il problema che si sta risolvendo.
+# Non e' una fonte di cui fidarsi, ed e' il motivo per cui si usa solo se
+# systemd-timesyncd ha gia' fallito: serve a superare l'handshake, poi l'NTP
+# corregge la deriva.
+ora_dal_backend() {
+    local url data
+    url="$(backend_url)" || return 1
+    [ -n "$url" ] || return 1
+    data="$(curl -sSI --max-time 15 "${url/https:/http:}/health" 2>/dev/null \
+            | sed -n 's/^[Dd]ate: //p' | tr -d '\r' | head -1 || true)"
+    [ -n "$data" ] || return 1
+    date -u -s "$data" >/dev/null 2>&1 || return 1
+    log "orologio impostato dalla risposta del backend: $(date -u '+%F %T UTC')"
+    return 0
+}
+
+attendi() {
+    local etichetta="$1" limite="$2"; shift 2
+    local trascorso=0
+    while ! "$@"; do
+        [ "$trascorso" -lt "$limite" ] || { log "$etichetta: non pronta dopo ${limite}s, proseguo"; return 1; }
+        sleep 5
+        trascorso=$((trascorso + 5))
+    done
+    [ "$trascorso" -gt 0 ] && log "$etichetta: pronta dopo ${trascorso}s"
+    return 0
+}
+
+riavvia_agent() {
+    log "riavvio $SERVIZIO ($1)"
+    systemctl restart "$SERVIZIO" || log "il riavvio di $SERVIZIO e' fallito"
+}
+
+# Il tunnel e' la via di rientro: se il box torna su senza, il prossimo guasto
+# si ripara solo andandoci. Si tocca solo quando il token c'e' gia' - nessun
+# token, nessun tunnel da rimettere in piedi.
+ripristina_tunnel() {
+    [ -f "$CF_ENV" ] || return 0
+    systemctl is-enabled cloudflared >/dev/null 2>&1 || return 0
+    if ! systemctl is-active --quiet cloudflared; then
+        log "cloudflared configurato ma fermo: lo riavvio"
+        systemctl restart cloudflared || log "cloudflared non riparte: journalctl -u cloudflared"
+    fi
+}
+
+guasti_letti()   { cat "$CONTATORE" 2>/dev/null || echo 0; }
+guasti_azzera()  { install -d -m 0755 "$STATO_DIR"; echo 0 > "$CONTATORE"; }
+guasti_conta()   { install -d -m 0755 "$STATO_DIR"; echo $(( $(guasti_letti) + 1 )) > "$CONTATORE"; }
+
+riavvio_macchina_consentito() {
+    local ultimo adesso
+    ultimo="$(cat "$ULTIMO_RIAVVIO" 2>/dev/null || echo 0)"
+    adesso="$(date +%s)"
+    [ $((adesso - ultimo)) -ge "$DISTANZA_RIAVVII" ]
+}
+
+riavvia_macchina() {
+    install -d -m 0755 "$STATO_DIR"
+    date +%s > "$ULTIMO_RIAVVIO"
+    guasti_azzera
+    log "l'agent non riparte da $((GUASTI_PER_RIAVVIO * 5)) minuti con la LAN presente: riavvio la macchina"
+    systemctl reboot
+}
+
+# --- modi ---------------------------------------------------------------------
+
+modo_avvio() {
+    install -d -m 0755 "$STATO_DIR"
+    if [ -e "$MARCATORE" ]; then
+        log "lo spegnimento precedente non e' stato pulito: blackout o corrente tolta"
+    fi
+    : > "$MARCATORE"
+    guasti_azzera
+
+    root_sola_lettura && log "ATTENZIONE: la radice e' montata in sola lettura, controlla il filesystem"
+
+    attendi "LAN" "$ATTESA_RETE" rete_pronta || true
+
+    if ! attendi "orologio" "$ATTESA_ORA" ora_credibile; then
+        ora_dal_backend || log "orologio ancora incerto: gli handshake TLS potrebbero fallire"
+    fi
+
+    ripristina_tunnel
+
+    # Riavviare per abitudine sarebbe rumore: si riavvia solo se l'agent e'
+    # partito prima della rete, o se non e' su, o se non da' segni di vita.
+    local motivo="" esito=0
+    if ! systemctl is-active --quiet "$SERVIZIO"; then
+        motivo="il servizio non e' attivo"
+    elif agent_senza_rete; then
+        motivo="e' partito senza rotta di default"
+    else
+        # `|| esito=$?` e non un `case $?` nudo: con set -e un comando che
+        # restituisce 1 fuori da una condizione fa uscire lo script, e uscire
+        # qui vorrebbe dire non riavviare proprio quando serviva.
+        agent_lavora 5 || esito=$?
+        if [ "$esito" -eq 1 ]; then
+            motivo="attivo ma senza heartbeat da 5 minuti"
+        fi
+    fi
+
+    if [ -z "$motivo" ]; then
+        log "l'agent lavora gia': non lo tocco"
+        exit 0
+    fi
+
+    riavvia_agent "$motivo"
+
+    # La prova che serve non e' "active": e' un heartbeat vero dopo il riavvio.
+    local trascorso=0
+    while [ "$trascorso" -lt "$ATTESA_PROVA" ]; do
+        sleep 10; trascorso=$((trascorso + 10))
+        if agent_lavora 3; then
+            log "ripresa completata in ${trascorso}s dopo il riavvio dell'agent"
+            exit 0
+        fi
+    done
+    if wan_pronta; then
+        log "nessun heartbeat entro ${ATTESA_PROVA}s con il backend raggiungibile: se ne occupa il controllo periodico"
+    else
+        log "nessun heartbeat, ma il backend non e' raggiungibile da qui: la linea del cliente e' giu', il box e' sano"
+    fi
+}
+
+modo_controllo() {
+    install -d -m 0755 "$STATO_DIR"
+    [ -e "$MARCATORE" ] || : > "$MARCATORE"
+
+    ripristina_tunnel
+
+    # Senza LAN non si giudica: il box puo' essere perfettamente sano dietro un
+    # router spento. Il contatore si azzera, altrimenti una nottata di linea giu'
+    # arriverebbe da sola al riavvio della macchina.
+    if ! rete_pronta; then
+        log "gateway non raggiungibile: non e' un guasto del box, non intervengo"
+        guasti_azzera
+        exit 0
+    fi
+
+    local guasto="" esito=0
+    if ! systemctl is-active --quiet "$SERVIZIO"; then
+        # `|| true` dentro la sostituzione: is-active su un servizio fermo esce
+        # con 3, e con set -e un'assegnazione che fallisce fa uscire lo script -
+        # proprio nel ramo in cui c'e' un guasto da riparare.
+        guasto="servizio non attivo ($(systemctl is-active "$SERVIZIO" 2>&1 || true))"
+    elif agent_senza_rete; then
+        guasto="partito senza rotta di default, la LAN adesso c'e'"
+    else
+        local fd; fd="$(descrittori_agent)"
+        if [ "$fd" -gt 200 ]; then
+            # Non e' una cura: e' un cerotto che tiene in piedi il sito finche'
+            # la perdita non viene corretta. Va sempre riportato a chiare lettere.
+            guasto="descrittori aperti: $fd (perdita in corso, vedi INVARIANTE 1)"
+        else
+            agent_lavora 12 || esito=$?
+            if [ "$esito" -eq 1 ]; then
+                # Un heartbeat che manca da dodici minuti non dice ancora di chi
+                # e' la colpa. Se il backend non risponde nemmeno a curl, la
+                # linea del cliente e' giu' e l'agent sta facendo la cosa giusta
+                # riprovando: riavviarlo non lo aiuta, e insistere porterebbe al
+                # riavvio della macchina per un guasto che non e' suo.
+                if wan_pronta; then
+                    guasto="attivo ma nessun heartbeat da 12 minuti, e il backend risponde"
+                else
+                    log "nessun heartbeat, ma il backend non risponde: e' la WAN del cliente, non il box"
+                fi
+            fi
+        fi
+    fi
+
+    if [ -z "$guasto" ]; then
+        guasti_azzera
+        exit 0
+    fi
+
+    guasti_conta
+    local n; n="$(guasti_letti)"
+    log "guasto rilevato ($n/$GUASTI_PER_RIAVVIO): $guasto"
+
+    if [ "$n" -ge "$GUASTI_PER_RIAVVIO" ] && riavvio_macchina_consentito; then
+        riavvia_macchina
+        return
+    fi
+    riavvia_agent "$guasto"
+}
+
+modo_spegnimento() {
+    rm -f "$MARCATORE"
+}
+
+modo_stato() {
+    local gw; gw="$(gateway_ip)"
+    printf 'servizio:       %s\n' "$(systemctl is-active "$SERVIZIO" 2>&1)"
+    printf 'gateway:        %s%s\n' "${gw:-nessuna rotta di default}" \
+        "$(rete_pronta && echo ' (risponde)' || echo ' (non risponde)')"
+    printf 'backend:        %s\n' "$(wan_pronta && echo raggiungibile || echo 'non raggiungibile')"
+    printf 'orologio:       %s%s\n' "$(date '+%F %T %Z')" \
+        "$(ora_credibile && echo '' || echo '  <-- non credibile')"
+    printf 'descrittori:    %s\n' "$(descrittori_agent)"
+    local esito=0
+    agent_lavora 12 || esito=$?
+    case "$esito" in
+        0) printf 'heartbeat:      visto negli ultimi 12 minuti\n' ;;
+        1) printf 'heartbeat:      ASSENTE negli ultimi 12 minuti\n' ;;
+        2) printf 'heartbeat:      il journal non ha righe recenti (box appena avviato?)\n' ;;
+    esac
+    printf 'rete rilevata:  %s\n' "$(agent_senza_rete && echo 'NO, agent partito senza rotta' || echo 'si')"
+    printf 'ultimo avvio:   %s\n' "$(uptime -p 2>/dev/null || echo '?')"
+    printf 'spegnimento:    %s\n' \
+        "$([ -e "$MARCATORE" ] && echo 'il marcatore c e'\'': se il box e'\'' appena ripartito, lo spegnimento precedente non era pulito' || echo 'pulito')"
+    printf 'guasti di fila: %s\n' "$(guasti_letti)"
+    root_sola_lettura && printf 'ATTENZIONE:     radice in sola lettura\n'
+    return 0
+}
+
+case "${1:---stato}" in
+    --avvio)       modo_avvio ;;
+    --controllo)   modo_controllo ;;
+    --spegnimento) modo_spegnimento ;;
+    --stato)       modo_stato ;;
+    -h|--help)     awk 'NR>1 { if (/^#/) { sub(/^# ?/,""); print } else exit }' "$0"; exit 0 ;;
+    *) log "modo sconosciuto: $1"; exit 2 ;;
+esac

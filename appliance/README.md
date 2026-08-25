@@ -96,13 +96,66 @@ Lo script è idempotente: rilanciarlo su un box già configurato aggiorna e bast
 5. scrive il token in `/etc/netmonitor/agent.env`, `0640 root:netmonitor`
 6. crea e avvia il servizio `netmonitor-agent`
 7. con `--tunnel-token`, installa anche `cloudflared` per l'accesso remoto
-8. verifica che il servizio giri e che il backend risponda
+8. installa `netmonitor-riavvio` e il suo timer: la ripresa dopo un blackout
+9. verifica che il servizio giri e che il backend risponda
 
 ### Cosa NON fa, di proposito
 
 **Non tocca la configurazione SSH.** Irrigidirla prima che esista una seconda via
 d'ingresso significa chiudersi fuori da un box headless a casa di un cliente. Si fa
 dopo, quando il tunnel funziona e l'hai provato.
+
+**Non cambia l'ordine di avvio senza che glielo si chieda.** Serve `--correggi-avvio`,
+e va fatto stando davanti al box: vedi più sotto.
+
+## Quando salta la corrente
+
+Un blackout non è "il box si spegne e si riaccende". È un caso a sé, e nessuna delle
+difese già in campo lo copre:
+
+- `Restart=always` riavvia i processi che muoiono. Qui non muore nessuno.
+- Il watchdog di systemd abbatte l'agent bloccato. Qui l'agent non è bloccato: gira,
+  e a ogni giro riferisce diligentemente che non c'è niente da scansionare.
+
+Quello che succede davvero è che **torna la corrente a tutti insieme**, e il box è
+pronto prima del router del cliente. Da lì partono tre guasti distinti:
+
+| Cosa | Perché fa male |
+|---|---|
+| Nessun lease DHCP all'avvio | l'agent rileva la rete una volta sola, all'avvio: senza rotta di default resta senza rete **per sempre**, con il servizio `active (running)` |
+| Orologio sbagliato | la RK322x non ha batteria tampone e riparte alla data dell'immagine: finché l'NTP non sincronizza, ogni handshake TLS verso il backend fallisce perché il certificato "non è ancora valido" |
+| u-boot che prova la rete | con il cavo staccato — o lo switch ancora spento — la board cerca di avviarsi da PXE invece che dalla eMMC, e a volte non ci arriva proprio |
+
+I primi due li risolve `netmonitor-riavvio`, installato come unit di avvio più un
+timer ogni cinque minuti. All'avvio aspetta che il gateway risponda (fino a cinque
+minuti: un MikroTik con un AP dietro ci mette il suo) e che l'orologio sia credibile,
+poi riavvia l'agent — **una volta, e solo se serve davvero**. Se l'NTP non ce la fa,
+l'ora si prende dall'intestazione `Date` della risposta del backend, in chiaro: in
+https il certificato non sarebbe ancora valido, ed è esattamente il problema che si
+sta risolvendo.
+
+Il terzo è il bootloader e si corregge una volta sola, con `netmonitor-boot-mmc`.
+
+```bash
+sudo netmonitor-riavvio --stato    # cosa sa e cosa farebbe, senza toccare niente
+sudo netmonitor-boot-mmc           # diagnosi dell'ordine di avvio
+sudo netmonitor-boot-mmc --applica # toglie pxe/dhcp: falla da davanti al box
+```
+
+### Il pezzo delicato: quando NON intervenire
+
+Un guardiano che riavvia troppo è peggio del guasto che cura. La regola è che si
+interviene solo davanti a una **prova di guasto locale**:
+
+- gateway che non risponde → non si tocca niente. Il router del cliente può essere
+  spento: il box è sano, e insistere lo porterebbe a riavviarsi in cerchio.
+- heartbeat assente **ma backend irraggiungibile** → non si tocca niente. È la linea
+  del cliente, e l'agent sta già facendo la cosa giusta riprovando.
+- servizio fermo, agent partito senza rotta, descrittori che crescono → quelli sì.
+
+Il riavvio della macchina arriva solo dopo tre controlli falliti di fila con la LAN
+presente (un quarto d'ora), e mai più di uno ogni sei ore. È la stessa scelta fatta
+nel watchdog dell'agent, che conferma il giro **fatto** e non il giro **riuscito**.
 
 ## Accesso remoto
 

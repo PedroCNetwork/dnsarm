@@ -7,6 +7,10 @@
 #   sudo ./install.sh --token <t> --router-user netmonitor --router-pass <pw>
 #       legge le tabelle del router (lease DHCP, WiFi, bridge): senza, il
 #       monitoraggio si ferma a "chi risponde", senza tipo ne' segnale.
+#   sudo ./install.sh --token <t> --correggi-avvio
+#       toglie pxe/dhcp dall'ordine di avvio di u-boot: con il cavo staccato la
+#       board prova la rete invece della eMMC. Da fare quando si e' davanti al
+#       box, non da remoto.
 #   sudo ./install.sh --dry-run --token x        mostra cosa farebbe, non tocca nulla
 #
 # --tunnel-token e' il token del Cloudflare Tunnel, preso dalla dashboard Zero
@@ -29,6 +33,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TOKEN=""; SITE_NAME=""; BACKEND=""; TUNNEL_TOKEN=""; DRY_RUN=0
 ROUTER_USER=""; ROUTER_PASS=""; ROUTER_PASS_GIVEN=0; ROUTER_SCHEME="https"
+CORREGGI_AVVIO=0
 
 # Un'opzione senza valore deve dirlo. Prima lo `shift` di troppo faceva uscire
 # lo script in silenzio (set -e), e il caso classico non e' la distrazione: e'
@@ -52,6 +57,7 @@ while [ $# -gt 0 ]; do
         --router-user)  _need_value "$1" $#; ROUTER_USER="$2"; shift ;;
         --router-pass)  _need_value "$1" $#; ROUTER_PASS="$2"; ROUTER_PASS_GIVEN=1; shift ;;
         --router-scheme) _need_value "$1" $#; ROUTER_SCHEME="$2"; shift ;;
+        --correggi-avvio) CORREGGI_AVVIO=1 ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) awk 'NR>1 { if (/^#/) { sub(/^# ?/,""); print } else exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Opzione sconosciuta: $1" >&2; exit 2 ;;
@@ -426,6 +432,100 @@ if [ -n "$TUNNEL_TOKEN" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Ripresa dopo il blackout
+#
+# Il caso che ne' Restart=always ne' il watchdog coprono: torna la corrente, il
+# box e il router del cliente si riaccendono insieme e il box e' pronto per
+# primo. L'agent parte senza lease DHCP, rileva la rete una volta sola e non ne
+# trova nessuna; l'orologio, senza RTC, riparte alla data dell'immagine e fa
+# fallire ogni handshake TLS. Nessun processo muore, quindi nessuno riavvia
+# niente e il sito resta muto finche' qualcuno non ci va.
+#
+# netmonitor-riavvio aspetta rete e orologio veri e solo allora riavvia l'agent.
+# Il timer poi ricontrolla ogni cinque minuti, e interviene solo davanti a una
+# prova di guasto locale: con la WAN giu' non tocca niente, perche' un box che
+# non raggiunge il cloud per colpa della linea del cliente e' un box sano.
+# ---------------------------------------------------------------------------
+step "Ripresa dopo il blackout"
+run install -d -m 0755 /var/lib/netmonitor
+run install -m 0755 "$REPO_DIR/appliance/netmonitor-riavvio" /usr/local/sbin/netmonitor-riavvio
+run install -m 0755 "$REPO_DIR/appliance/netmonitor-boot-mmc" /usr/local/sbin/netmonitor-boot-mmc
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf '    [dry-run] unit netmonitor-riavvio.service, netmonitor-controllo.service e .timer\n'
+else
+    cat > /etc/systemd/system/netmonitor-riavvio.service <<'EOF'
+[Unit]
+Description=Ripresa di NetMonitor dopo uno spegnimento improvviso
+After=network-online.target netmonitor-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Serve per due motivi: tenere l'unit "attiva" fino allo spegnimento, cosi'
+# ExecStop puo' segnare che lo spegnimento e' stato pulito, e distinguere al
+# prossimo avvio il riavvio voluto dalla corrente che se ne va.
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/netmonitor-riavvio --avvio
+ExecStop=/usr/local/sbin/netmonitor-riavvio --spegnimento
+# Aspetta il router del cliente, che dopo un blackout ci mette minuti a
+# distribuire lease: il valore predefinito di 90 secondi lo ucciderebbe a meta'
+# attesa, proprio nel caso per cui esiste.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/netmonitor-controllo.service <<'EOF'
+[Unit]
+Description=Controllo periodico dell'agent NetMonitor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/netmonitor-riavvio --controllo
+TimeoutStartSec=300
+EOF
+
+    cat > /etc/systemd/system/netmonitor-controllo.timer <<'EOF'
+[Unit]
+Description=Ogni cinque minuti, controlla che l'agent lavori davvero
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+# Senza, tutti i box installati insieme busserebbero al backend nello stesso
+# istante. Non e' un carico serio, ma non c'e' motivo di crearlo.
+RandomizedDelaySec=60
+Unit=netmonitor-controllo.service
+
+[Install]
+WantedBy=timers.target
+EOF
+fi
+run systemctl daemon-reload
+run systemctl enable netmonitor-riavvio.service
+run systemctl enable --now netmonitor-controllo.timer
+# start senza attendere: l'unit di avvio puo' restare in attesa della rete per
+# minuti, e l'installer non ha motivo di stare fermo li' a guardarla.
+run systemctl start --no-block netmonitor-riavvio.service
+ok "ripresa automatica attiva (netmonitor-riavvio --stato per vedere cosa sa)"
+
+# L'ordine di avvio di u-boot si tocca solo se lo si e' chiesto: la correzione
+# vale dal prossimo avvio, e un avvio che va storto su un box remoto non si
+# ripara da remoto. La diagnosi invece si stampa sempre, cosi' resta nel log
+# dell'installazione anche di chi non la applica adesso.
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf '    [dry-run] diagnosi dell ordine di avvio\n'
+elif [ "$CORREGGI_AVVIO" -eq 1 ]; then
+    /usr/local/sbin/netmonitor-boot-mmc --applica \
+        || warn "correzione dell'ordine di avvio non riuscita: leggi sopra il motivo"
+else
+    /usr/local/sbin/netmonitor-boot-mmc || true
+    warn "ordine di avvio non modificato: rilancia con --correggi-avvio stando davanti al box"
+fi
+
+# ---------------------------------------------------------------------------
 # Verifica
 # ---------------------------------------------------------------------------
 step "Verifica"
@@ -449,6 +549,12 @@ cat <<EOF
     L'accesso remoto ora si attiva da NetMonitor, senza tornare qui: incolla
     il token del connettore Cloudflare nella pagina del sito. Il box lo ritira
     al primo heartbeat e riferisce se il tunnel e' salito.
+
+    Dopo un blackout il box si rimette in piedi da solo: aspetta che il router
+    del cliente torni a distribuire lease e che l'orologio sia vero, poi riavvia
+    l'agent. Per vedere cosa sa in questo momento:
+
+        sudo netmonitor-riavvio --stato
 
     ${YELLOW}SSH non e' stato irrigidito${OFF}: si fa in A2, quando la VPN
     funziona e hai una seconda via d'ingresso.

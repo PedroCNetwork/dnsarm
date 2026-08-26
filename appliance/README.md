@@ -3,6 +3,9 @@
 Un piccolo computer sotto Armbian (TV box, Raspberry, mini PC) che monitora la rete
 di un sito, ne diventa il punto di accesso remoto e comanda il firewall del router.
 
+> **È la prima volta?** Segui **[GUIDA.md](GUIDA.md)**: la stessa procedura in
+> parole semplici, pensata perché chiunque possa mettere online un sito nuovo.
+>
 > **Devi installarne uno adesso?** Segui **[INSTALLAZIONE.md](INSTALLAZIONE.md)**:
 > è la procedura in ordine, dal sito da creare alla verifica finale, con la tabella
 > dei guasti già visti. Questo README spiega invece *perché* le cose stanno così, e
@@ -97,7 +100,8 @@ Lo script è idempotente: rilanciarlo su un box già configurato aggiorna e bast
 6. crea e avvia il servizio `netmonitor-agent`
 7. con `--tunnel-token`, installa anche `cloudflared` per l'accesso remoto
 8. installa `netmonitor-riavvio` e il suo timer: la ripresa dopo un blackout
-9. verifica che il servizio giri e che il backend risponda
+9. fa entrare la console da sola al riavvio (`--senza-autologin` per non farlo)
+10. verifica che il servizio giri e che il backend risponda
 
 ### Cosa NON fa, di proposito
 

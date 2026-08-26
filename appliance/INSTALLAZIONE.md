@@ -4,6 +4,10 @@ Procedura completa, dall'inizio alla verifica. Pensata per essere seguita senza
 ricordarsi niente: ogni passo dice cosa fare, cosa deve succedere, e cosa fare
 se non succede.
 
+> **È la prima volta che ne installi uno?** Usa **[GUIDA.md](GUIDA.md)**: stessa
+> procedura, scritta in parole semplici e senza dare niente per scontato. Questo
+> file è la versione breve, per chi l'ha già fatto.
+
 Tempo indicativo: **20 minuti**, di cui metà è attesa di `apt`.
 
 ---
@@ -137,6 +141,16 @@ sudo ./appliance/install.sh \
 La password del router te la chiede a schermo, con l'input nascosto. È anche il
 modo più sicuro di darla: sulla riga di comando finirebbe nella cronologia della
 shell e sarebbe visibile a chiunque faccia `ps`.
+
+**Da qui in poi la console entra da sola**: al riavvio il box non chiede più la
+password sul monitor, così chi va sul posto lo trova pronto. Chi ha accesso
+fisico ottiene una shell — SSH non cambia. Per non farlo, `--senza-autologin`;
+per scegliere un altro utente, `--autologin <nome>`.
+
+> Se il box è appena uscito dall'immagine Armbian e non hai ancora fatto il
+> primo accesso a mano, fallo **prima** di riavviare: Armbian si ferma su un
+> questionario obbligatorio, e con l'accesso automatico nessuno lo vedrebbe.
+> L'installer te lo dice se rileva il caso.
 
 Il passaggio dei pacchetti dura diversi minuti su hardware lento. **Non
 interrompere**: `apt` a metà lascia il sistema in uno stato scomodo da sbrogliare.

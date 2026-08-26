@@ -7,6 +7,10 @@
 #   sudo ./install.sh --token <t> --router-user netmonitor --router-pass <pw>
 #       legge le tabelle del router (lease DHCP, WiFi, bridge): senza, il
 #       monitoraggio si ferma a "chi risponde", senza tipo ne' segnale.
+#   sudo ./install.sh --token <t> --autologin <utente> | --senza-autologin
+#       la console entra da sola al riavvio, senza chiedere la password. Senza
+#       l'opzione sceglie il primo utente vero del box. Chi ha accesso fisico
+#       ottiene una shell: SSH non cambia, ma sappilo.
 #   sudo ./install.sh --token <t> --correggi-avvio
 #       toglie pxe/dhcp dall'ordine di avvio di u-boot: con il cavo staccato la
 #       board prova la rete invece della eMMC. Da fare quando si e' davanti al
@@ -33,7 +37,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TOKEN=""; SITE_NAME=""; BACKEND=""; TUNNEL_TOKEN=""; DRY_RUN=0
 ROUTER_USER=""; ROUTER_PASS=""; ROUTER_PASS_GIVEN=0; ROUTER_SCHEME="https"
-CORREGGI_AVVIO=0
+CORREGGI_AVVIO=0; AUTOLOGIN=""; SENZA_AUTOLOGIN=0
 
 # Un'opzione senza valore deve dirlo. Prima lo `shift` di troppo faceva uscire
 # lo script in silenzio (set -e), e il caso classico non e' la distrazione: e'
@@ -58,6 +62,8 @@ while [ $# -gt 0 ]; do
         --router-pass)  _need_value "$1" $#; ROUTER_PASS="$2"; ROUTER_PASS_GIVEN=1; shift ;;
         --router-scheme) _need_value "$1" $#; ROUTER_SCHEME="$2"; shift ;;
         --correggi-avvio) CORREGGI_AVVIO=1 ;;
+        --autologin)      _need_value "$1" $#; AUTOLOGIN="$2"; shift ;;
+        --senza-autologin) SENZA_AUTOLOGIN=1 ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) awk 'NR>1 { if (/^#/) { sub(/^# ?/,""); print } else exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Opzione sconosciuta: $1" >&2; exit 2 ;;
@@ -226,6 +232,58 @@ if [ -e /dev/watchdog ]; then
     ok "watchdog hardware presente e armato"
 else
     warn "Nessun /dev/watchdog: il box non si riavvia da solo se si pianta."
+fi
+
+# Accesso automatico alla console. Il monitoraggio non ne ha bisogno - i servizi
+# partono col sistema, non con l'utente - ma chi va sul posto con un monitor e
+# una tastiera trova il box gia' pronto invece di una richiesta di password che
+# nessuno, in quel locale, conosce.
+#
+# Va detto chiaro: chi ha accesso fisico al box ottiene una shell senza
+# password. SSH e la rete non c'entrano e restano come sono; la difesa qui e'
+# la stessa di sempre, cioe' dove il box e' appoggiato.
+step "Accesso automatico alla console"
+if [ "$SENZA_AUTOLOGIN" -eq 1 ]; then
+    warn "saltato: richiesto --senza-autologin"
+else
+    # Il primo utente vero: l'agent gira come utente di sistema con nologin, e
+    # non e' lui che deve entrare in console.
+    AUTOLOGIN_USER="${AUTOLOGIN:-$(awk -F: '$3>=1000 && $3<65534 && $7 !~ /(nologin|false)$/ {print $1; exit}' /etc/passwd)}"
+    if [ -z "$AUTOLOGIN_USER" ]; then
+        warn "nessun utente normale sul box: accesso automatico non configurato"
+    elif ! id "$AUTOLOGIN_USER" >/dev/null 2>&1; then
+        die "L'utente $AUTOLOGIN_USER non esiste su questo box."
+    else
+        # Il drop-in, non l'unit: cosi' un aggiornamento di systemd non lo
+        # cancella. Il primo ExecStart vuoto serve a svuotare quello originale,
+        # altrimenti systemd li eseguirebbe tutti e due.
+        for TTY in tty1 $( [ -e /dev/ttyS2 ] && echo ttyS2 ); do
+            case "$TTY" in
+                tty1) UNIT="getty@tty1.service" ;;
+                *)    UNIT="serial-getty@$TTY.service" ;;
+            esac
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf '    [dry-run] accesso automatico di %s su %s\n' "$AUTOLOGIN_USER" "$TTY"
+                continue
+            fi
+            install -d "/etc/systemd/system/$UNIT.d"
+            cat > "/etc/systemd/system/$UNIT.d/autologin.conf" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $AUTOLOGIN_USER --noclear %I \$TERM
+EOF
+        done
+        run systemctl daemon-reload
+        ok "console: entra da sola come $AUTOLOGIN_USER"
+
+        # Armbian, al primo accesso, obbliga a cambiare password e a rispondere
+        # a un questionario. Con l'accesso automatico attivo il box si fermerebbe
+        # li', su una domanda che nessuno vedra' mai.
+        if [ -e /root/.not_logged_in_yet ]; then
+            warn "la configurazione iniziale di Armbian non e' ancora stata fatta:"
+            warn "fai un accesso a mano adesso, altrimenti al riavvio il box si ferma sul questionario"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------

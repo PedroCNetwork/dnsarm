@@ -17,6 +17,8 @@ Tempo indicativo: **20 minuti**, di cui metà è attesa di `apt`.
 Da avere sotto mano:
 
 - il **box** con Armbian installato e collegato via cavo a una porta LAN del router
+  (se è appena uscito dal Multitool e non arriva al login, prima passa da
+  **[AVVIO-RK322X.md](AVVIO-RK322X.md)**)
 - accesso al **router** del cliente (utente amministrativo)
 - il **nome del sito** e la **rete** (es. `192.168.88.0/24`)
 - facoltativo: un token di **Cloudflare Tunnel**, per l'accesso remoto
@@ -283,8 +285,24 @@ Cloudflare. Nel tunnel, **Public Hostname → Add**: sottodominio + servizio
 (es. `http://192.168.88.1` per WebFig). Proteggilo con una policy di Access,
 altrimenti è pubblico.
 
-Attenzione a non sovrapporre reti: due clienti entrambi su `192.168.1.0/24` non
-possono stare nella stessa organizzazione WARP con rotte private uguali.
+**Due clienti con la stessa rete** (tipico di una catena, dove ogni locale usa
+`192.168.168.0/24`): non possono stare sulla stessa rete virtuale, perche'
+Cloudflare avrebbe due strade identiche e nessun modo di scegliere. La soluzione
+sono le **reti virtuali**: se ne crea una per sito e ci si aggancia la rotta di
+quel sito. Nell'app si sceglie su quale rete virtuale si e', come si cambia
+profilo in un client VPN.
+
+Limite da conoscere: si sta su **una rete virtuale alla volta**, quindi non si
+raggiungono due locali con lo stesso indirizzamento nello stesso momento. Per
+l'assistenza va bene; per vedere tutti i siti insieme c'e' gia' NetMonitor, che
+raccoglie dai box e non passa dal tunnel.
+
+L'alternativa che il problema lo toglie invece di gestirlo: dare a ogni locale
+un indirizzamento diverso (`192.168.101.0/24`, `192.168.102.0/24`...). Se la
+rete la installi tu, e' piu' semplice di qualunque rete virtuale.
+
+A riconoscere dove si e' finiti ci pensa il nome del box: `install.sh` lo
+rinomina `netmon-<sito>`, quindi il prompt SSH dice sempre di chi e' il locale.
 
 Limite del piano gratuito: **10 GB al mese** di traffico WARP — abbondante per
 gestione, stretto per travasare firmware.
@@ -325,6 +343,7 @@ Le note sono il posto per le cose che nessun protocollo ti dirà mai:
 | Un apparato compare **due volte** | riga vecchia a database | si autocorregge al ciclo successivo dopo l'aggiornamento del backend |
 | Dopo un **blackout** il sito resta offline | il box è ripartito prima del router: nessun lease DHCP, nessuna rete rilevata, e senza RTC l'orologio sbagliato fa fallire il TLS | ci pensa `netmonitor-riavvio`, che aspetta rete e ora vere e riavvia l'agent; per vedere cosa sa: `sudo netmonitor-riavvio --stato` |
 | Il box **non si accende più** dopo un blackout | u-boot prova la rete prima della eMMC | `sudo netmonitor-boot-mmc` (passo 4.1), da fare stando davanti al box |
+| **Box nuovo**: dopo il Multitool si ferma al prompt `=>` di u-boot | u-boot non ha la eMMC fra le destinazioni di avvio | **[AVVIO-RK322X.md](AVVIO-RK322X.md)** — cinque minuti con una tastiera attaccata |
 | `Nessuna rete da scansionare` nel log | l'agent è partito senza rotta di default | si ricorregge da solo al giro di telemetria successivo; se resta, `sudo netmonitor-riavvio --stato` |
 
 ### La diagnosi che risponde in dieci secondi

@@ -729,10 +729,45 @@ class Agent:
                 # heartbeat, questa la anticipa di qualche decina di secondi
                 # quando il WebSocket e' vivo.
                 self._esegui_istruzione_tunnel(payload)
+            elif action == "aggiorna_ora":
+                # "Controlla adesso" dalla dashboard: rifa' subito il giro di
+                # telemetria invece di aspettare il prossimo, che puo' essere
+                # fra un minuto.
+                #
+                # Non e' un ping a parte, ed e' voluto: passa dallo stesso
+                # percorso della telemetria periodica, quindi aggiorna device e
+                # client con le stesse regole - niente sorgente nuova, niente
+                # invariante nuovo da difendere.
+                #
+                # Un task una tantum, non `_supervise`: quello riavvia i cicli
+                # di fondo all'infinito, e qui rifarebbe la telemetria per
+                # sempre. Ma nemmeno lanciato e dimenticato: senza il wrapper,
+                # un'eccezione qui dentro verrebbe messa da parte da asyncio e
+                # non la leggerebbe nessuno.
+                asyncio.create_task(self._aggiorna_su_richiesta())
             elif action == "ping":
                 await self._send_ws(ws, {"action": "pong", "payload": {}})
             else:
                 logger.info("Ignoring unknown WS action: %s", action)
+
+    async def _aggiorna_su_richiesta(self) -> None:
+        """Un giro di telemetria fuori turno, chiesto dalla dashboard.
+
+        Stesso limite di durata del ciclo periodico: un giro che non torna piu'
+        - un ping che non esce, un apparato che accetta la connessione SNMP e
+        non risponde mai - non deve restare appeso a occupare descrittori.
+        """
+        try:
+            await asyncio.wait_for(
+                self._send_telemetry(),
+                timeout=max(config.TELEMETRY_INTERVAL * 5, 300),
+            )
+            logger.info("Aggiornamento chiesto a mano: completato")
+        except asyncio.TimeoutError:
+            logger.error("Aggiornamento chiesto a mano: troppo lungo, troncato")
+        except Exception as e:
+            logger.error("Aggiornamento chiesto a mano fallito: %s", e)
+            muori_se_senza_descrittori(e, "l'aggiornamento chiesto a mano")
 
     async def _handle_discovery(
         self, ws: websockets.WebSocketClientProtocol, network: str
